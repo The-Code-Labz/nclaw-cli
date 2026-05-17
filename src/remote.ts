@@ -421,7 +421,7 @@ export function chat(opts: ChatOptions): Promise<void> {
 // ── Utility endpoints ────────────────────────────────────────────────────────
 
 export async function checkConnection(url: string, token: string): Promise<void> {
-  const parsed = new URL(`${url.replace(/\/$/, '')}/api/health`);
+  const parsed = new URL(`${url.replace(/\/$/, '')}/api/status`);
   const opts   = makeOpts(parsed, 'GET', { 'x-dashboard-token': token });
   return new Promise((resolve, reject) => {
     const req = httpLib(parsed).request(opts, (res) => {
