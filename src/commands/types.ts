@@ -12,14 +12,16 @@ export interface CommandContext {
   getLastAgentMessage: () => string | null;
   /** Append a synthetic system message to the transcript. */
   emitSystem:    (text: string) => void;
+  /** Stream lines into the transcript in real time (for /update). */
+  emitLines:     (lines: string[]) => void;
 }
 
 export type CommandCategory = 'session' | 'agent' | 'system' | 'help';
 
 export interface Command {
-  name:        string;             // canonical, e.g. "clear"
-  slash:       string;             // "/clear"
-  aliases?:    string[];           // ["/cls"]
+  name:        string;
+  slash:       string;
+  aliases?:    string[];
   description: string;
   category:    CommandCategory;
   run:         (ctx: CommandContext, args: string[]) => void | Promise<void>;

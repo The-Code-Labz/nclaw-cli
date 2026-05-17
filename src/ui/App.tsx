@@ -419,6 +419,17 @@ export default function App({ cfg, agents: initialAgents }: Props) {
       };
       setStaticMessages(prev => [...prev, sysMsg]);
     },
+    emitLines: (lines: string[]) => {
+      // Each line is a separate system message — allows /update to stream live output
+      setStaticMessages(prev => [
+        ...prev,
+        ...lines.map(line => ({
+          role:      'agent' as const,
+          agentName: 'nclaw',
+          items:     [{ kind: 'text' as const, content: line }],
+        })),
+      ]);
+    },
   }), [handleSubmit, exit]);
 
   // ── Render ────────────────────────────────────────────────────────────────
