@@ -1,18 +1,16 @@
 /**
  * App — root TUI component.
  *
- * Improvements over original:
- * - Welcome splash screen rendered into <Static> (never re-renders).
- * - sessionId shown in Footer.
- * - Arrow-key agent picker instead of number input.
- * - stalled prop passed to Footer.
- * - cleaner message commit to Static on stream end.
- * - /help renders a proper help table inline instead of emitSystem string.
- * - Error recovery: errors shown in InputBar, not as a terminal dump.
- * - Agent refresh after /agent switch confirmed.
+ * Layout philosophy (Claude Code / opencode):
+ *   - Do NOT set a fixed height on the root box. Let Ink + the terminal
+ *     manage vertical space. Static scrolls naturally; live content sticks
+ *     to the bottom.
+ *   - The bottom chrome (divider + InputBar + Footer) is pinned by being
+ *     rendered last; Ink always appends to the current cursor position.
+ *   - No overflow/clip fighting — just natural terminal scroll.
  */
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
-import { Box, Static, useApp } from 'ink';
+import { Box, Static, Text, useApp } from 'ink';
 import fs from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
@@ -28,7 +26,7 @@ import { commands } from '../commands/registry';
 import type { CommandContext } from '../commands/types';
 import { isYoloMode } from '../permissions';
 
-// ── Package version ──────────────────────────────────────────────────────────
+// ── Package version ───────────────────────────────────────────────────────────
 let PKG_VERSION = '0.2.0';
 try {
   const pkgPath = path.join(__dirname, '..', 'package.json');
@@ -67,7 +65,19 @@ function toolLabel(args: Record<string, unknown>): string {
   return String(args['path'] ?? args['command'] ?? args['title'] ?? '').slice(0, 60);
 }
 
-// ── Help table ───────────────────────────────────────────────────────────────
+// ── Divider line ──────────────────────────────────────────────────────────────
+function Divider({ streaming }: { streaming: boolean }) {
+  const cols  = process.stdout.columns ?? 80;
+  const char  = '─';
+  const color = streaming ? '#22D3EE' : '#374151';
+  return (
+    <Box paddingX={1}>
+      <Text color={color}>{char.repeat(Math.max(1, cols - 2))}</Text>
+    </Box>
+  );
+}
+
+// ── Help message ──────────────────────────────────────────────────────────────
 function makeHelpMessage(): Message {
   const lines: string[] = [
     'Available commands:',
@@ -78,13 +88,12 @@ function makeHelpMessage(): Message {
     '  Ctrl+C         abort stream · exit',
     '  Ctrl+U         clear input',
     '  Ctrl+W         delete word',
-    '  Ctrl+K         delete to end',
+    '  Ctrl+K         delete to end of line',
     '  Ctrl+A / Home  beginning of line',
     '  Ctrl+E / End   end of line',
     '  Shift+Enter    insert newline',
     '  ↑↓             history navigation',
-    '  /command ↑↓    navigate suggestions',
-    '  Tab            select suggestion',
+    '  /cmd ↑↓ Tab    command suggestions',
   ];
   return {
     role:      'agent',
@@ -123,8 +132,8 @@ export default function App({ cfg, agents: initialAgents }: Props) {
   const lastUserRef = useRef<string | null>(null);
   const staticRef   = useRef<Message[]>([]);
 
-  useEffect(() => { staticRef.current  = staticMessages;  }, [staticMessages]);
-  useEffect(() => { activeRef.current  = activeMessage;   }, [activeMessage]);
+  useEffect(() => { staticRef.current = staticMessages; }, [staticMessages]);
+  useEffect(() => { activeRef.current = activeMessage;  }, [activeMessage]);
 
   // ── Git status ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -161,7 +170,7 @@ export default function App({ cfg, agents: initialAgents }: Props) {
     mutateActive(prev => ({ ...prev, items: [...prev.items, item] }));
   }, [mutateActive]);
 
-  // ── Streamed text batching (16ms flush — one animation frame) ────────────
+  // ── Streamed text batching (16ms = one ~60fps frame) ─────────────────────
   const flushChunkBuffer = useCallback(() => {
     flushTimer.current = null;
     const buffered = chunkBuffer.current;
@@ -194,7 +203,6 @@ export default function App({ cfg, agents: initialAgents }: Props) {
   const appendChunk = useCallback((chunk: string) => {
     chunkBuffer.current += chunk;
     if (flushTimer.current == null) {
-      // 16ms ≈ one 60fps frame — smoother than the old 30ms
       flushTimer.current = setTimeout(flushChunkBuffer, 16);
     }
   }, [flushChunkBuffer]);
@@ -207,45 +215,28 @@ export default function App({ cfg, agents: initialAgents }: Props) {
           const key = e.toolCallId ?? e.tool;
           toolTimers.current.set(key, Date.now());
           flushChunkBuffer();
-          appendItem({
-            kind:       'tool_call',
-            tool:       e.tool,
-            label:      toolLabel(e.args ?? {}),
-            toolCallId: e.toolCallId,
-          });
+          appendItem({ kind: 'tool_call', tool: e.tool, label: toolLabel(e.args ?? {}), toolCallId: e.toolCallId });
           setToolCount(n => n + 1);
         }
         break;
-
       case 'tool_done':
         if (e.tool) {
-          const key      = e.toolCallId ?? e.tool;
-          const started  = toolTimers.current.get(key);
-          const duration = started ? Date.now() - started : undefined;
+          const key     = e.toolCallId ?? e.tool;
+          const started = toolTimers.current.get(key);
+          const dur     = started ? Date.now() - started : undefined;
           toolTimers.current.delete(key);
-          mutateActive(prev => {
-            // Find the pending tool_call item and replace it with tool_done.
-            const items = prev.items.map(item => {
-              if (
-                item.kind === 'tool_call' &&
-                (item.toolCallId === e.toolCallId || item.tool === e.tool) &&
-                !prev.items.some(i => i.kind === 'tool_done' && i.toolCallId === e.toolCallId)
-              ) {
-                return {
-                  kind:          'tool_done' as const,
-                  tool:          e.tool!,
-                  durationMs:    duration,
-                  toolCallId:    e.toolCallId,
-                  outputPreview: e.preview,
-                };
-              }
-              return item;
-            });
-            return { ...prev, items };
-          });
+          mutateActive(prev => ({
+            ...prev,
+            items: prev.items.map(item =>
+              item.kind === 'tool_call' &&
+              (item.toolCallId === e.toolCallId || item.tool === e.tool) &&
+              !prev.items.some(i => i.kind === 'tool_done' && i.toolCallId === e.toolCallId)
+                ? { kind: 'tool_done' as const, tool: e.tool!, durationMs: dur, toolCallId: e.toolCallId, outputPreview: e.preview }
+                : item
+            ),
+          }));
         }
         break;
-
       case 'step_start':
         flushChunkBuffer();
         appendItem({ kind: 'step_start', stepIndex: e.stepIndex ?? 0, task: e.task ?? '', agentName: e.agentName ?? '' });
@@ -278,31 +269,23 @@ export default function App({ cfg, agents: initialAgents }: Props) {
         appendItem({ kind: 'interrupted', reason: e.reason ?? 'unknown' });
         break;
       case 'meta':
-        setMetaInfo({
-          tokensIn:  e.tokensIn,
-          tokensOut: e.tokensOut,
-          costUsd:   e.costUsd,
-          model:     e.model,
-        });
+        setMetaInfo({ tokensIn: e.tokensIn, tokensOut: e.tokensOut, costUsd: e.costUsd, model: e.model });
         break;
     }
   }, [mutateActive, appendItem, flushChunkBuffer]);
 
-  // ── Submit a user message ─────────────────────────────────────────────────
+  // ── Submit ────────────────────────────────────────────────────────────────
   const handleSubmit = useCallback(async (text: string) => {
     if (streaming) return;
-
     lastUserRef.current = text;
     setError(null);
     setStalled(false);
     setStreaming(true);
     setToolCount(0);
 
-    // Push user message to static immediately.
     const userMsg: Message = { role: 'user', items: [{ kind: 'text', content: text }] };
     setStaticMessages(prev => [...prev, userMsg]);
 
-    // Create blank agent message for streaming into.
     const agentMsg: Message = { role: 'agent', agentName: currentAgent.name, items: [] };
     setActiveMessage(agentMsg);
     activeRef.current = agentMsg;
@@ -319,67 +302,48 @@ export default function App({ cfg, agents: initialAgents }: Props) {
         agentId:  currentAgent.id,
         context,
         signal:   abort.signal,
-        onStall:     () => setStalled(true),
-        onStallClear:() => setStalled(false),
-        onConfirm: handleConfirm,
-        onChunk:   appendChunk,
-        onSession: (sid) => setSessionId(sid),
-        onDisplay: handleDisplay,
+        onStall:      () => setStalled(true),
+        onStallClear: () => setStalled(false),
+        onConfirm:  handleConfirm,
+        onChunk:    appendChunk,
+        onSession:  (sid) => setSessionId(sid),
+        onDisplay:  handleDisplay,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg !== 'cancelled by user') {
         setError(msg);
-        mutateActive(prev => ({
-          ...prev,
-          items: [...prev.items, { kind: 'error', message: msg }],
-        }));
+        mutateActive(prev => ({ ...prev, items: [...prev.items, { kind: 'error', message: msg }] }));
       }
     } finally {
-      // Flush any remaining buffered text.
       if (flushTimer.current) { clearTimeout(flushTimer.current); flushTimer.current = null; }
       flushChunkBuffer();
-
-      // Commit active → static.
       const finished = activeRef.current;
-      if (finished) {
-        setStaticMessages(prev => [...prev, finished]);
-      }
+      if (finished) setStaticMessages(prev => [...prev, finished]);
       setActiveMessage(null);
-      activeRef.current = null;
-      abortRef.current  = null;
+      activeRef.current  = null;
+      abortRef.current   = null;
       setStreaming(false);
       setStalled(false);
     }
-  }, [
-    streaming, sessionId, currentAgent, cfg, context,
-    appendChunk, handleConfirm, handleDisplay, flushChunkBuffer, mutateActive,
-  ]);
+  }, [streaming, sessionId, currentAgent, cfg, context, appendChunk, handleConfirm, handleDisplay, flushChunkBuffer, mutateActive]);
 
   // ── Abort ─────────────────────────────────────────────────────────────────
-  const handleAbort = useCallback(() => {
-    abortRef.current?.abort();
-  }, []);
+  const handleAbort = useCallback(() => { abortRef.current?.abort(); }, []);
 
   // ── Agent picker ──────────────────────────────────────────────────────────
   const handleAgentSelected = useCallback(async (n: number) => {
     setPendingAgentPick(false);
-    setValue_unused(''); // clear the picker input
     const active = agents.filter(a => a.status === 'active');
     const chosen = active[n - 1];
     if (!chosen) return;
     setCurrentAgent(chosen);
-    // Emit a system note.
-    const note: Message = {
+    setStaticMessages(prev => [...prev, {
       role:      'agent',
       agentName: 'nclaw',
       items:     [{ kind: 'text', content: `Switched to ${chosen.name}` }],
-    };
-    setStaticMessages(prev => [...prev, note]);
+    }]);
   }, [agents]);
-
-  // Dummy to avoid unused var lint — the agent picker no longer uses a text value.
-  const setValue_unused = (_: string) => {};
 
   // ── Command context ───────────────────────────────────────────────────────
   const cmdCtx = useMemo<CommandContext>(() => ({
@@ -394,7 +358,7 @@ export default function App({ cfg, agents: initialAgents }: Props) {
       setMetaInfo({});
       setToolCount(0);
     },
-    setCwdDisplay: () => {}, // unused — Footer reads process.cwd() directly
+    setCwdDisplay: () => {},
     getLastAgentMessage: () => {
       const msgs = [...staticRef.current];
       for (let i = msgs.length - 1; i >= 0; i--) {
@@ -412,15 +376,13 @@ export default function App({ cfg, agents: initialAgents }: Props) {
         setStaticMessages(prev => [...prev, makeHelpMessage()]);
         return;
       }
-      const sysMsg: Message = {
+      setStaticMessages(prev => [...prev, {
         role:      'agent',
         agentName: 'nclaw',
         items:     [{ kind: 'text', content: text }],
-      };
-      setStaticMessages(prev => [...prev, sysMsg]);
+      }]);
     },
     emitLines: (lines: string[]) => {
-      // Each line is a separate system message — allows /update to stream live output
       setStaticMessages(prev => [
         ...prev,
         ...lines.map(line => ({
@@ -436,8 +398,10 @@ export default function App({ cfg, agents: initialAgents }: Props) {
   const host = getHost(cfg.url);
 
   return (
-    <Box flexDirection="column" height={process.stdout.rows ?? 24}>
-      {/* Static: welcome + committed messages */}
+    // NO fixed height — let the terminal scroll naturally.
+    // flexDirection=column is still needed so Static + live + chrome stack vertically.
+    <Box flexDirection="column">
+      {/* ── Scrollback: welcome splash + committed messages ────────────── */}
       <Static items={[
         { _type: 'welcome' as const },
         ...staticMessages.map((m, i) => ({ _type: 'msg' as const, m, i })),
@@ -450,25 +414,21 @@ export default function App({ cfg, agents: initialAgents }: Props) {
                 version={PKG_VERSION}
                 host={host}
                 agentName={currentAgent.name}
-                model={metaInfo.model}
               />
             );
           }
-          return <MessageBubble key={item.i} message={item.m} />;
+          return <MessageBubble key={`msg-${item.i}`} message={item.m} />;
         }}
       </Static>
 
-      {/* Live streaming message */}
+      {/* ── Live streaming message ─────────────────────────────────────── */}
       {activeMessage && (
         <MessageBubble message={activeMessage} isStreaming={streaming} />
       )}
 
-      {/* Divider */}
-      <Box paddingX={1}>
-        <Box borderStyle="single" borderColor={streaming ? 'cyan' : 'gray'} width="100%" />
-      </Box>
+      {/* ── Bottom chrome — always visible at cursor position ─────────── */}
+      <Divider streaming={streaming} />
 
-      {/* Input */}
       <InputBar
         streaming={streaming}
         pendingConfirm={pendingConfirm}
@@ -489,7 +449,6 @@ export default function App({ cfg, agents: initialAgents }: Props) {
         cmdCtx={cmdCtx}
       />
 
-      {/* Footer */}
       <Footer
         cwd={process.cwd()}
         agentName={currentAgent.name}
