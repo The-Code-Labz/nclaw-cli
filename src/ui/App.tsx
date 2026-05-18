@@ -8,10 +8,16 @@
  *   - The bottom chrome (divider + InputBar + Footer) is pinned by being
  *     rendered last; Ink always appends to the current cursor position.
  *   - No overflow/clip fighting — just natural terminal scroll.
+ *
+ * Features added in v0.3.0:
+ *   - /cd <path>   — change cwd mid-session; agent context updates immediately
+ *   - /files [dir] — list directory inline with multi-column layout
+ *   - Diff view    — fs_write tool_done events render before/after diff
+ *   - Auto-reconnect — SSE drop → exponential backoff re-send of last message
  */
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { Box, Static, Text, useApp } from 'ink';
-import fs from 'fs';
+import fs   from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
 import { chat, listAgents, RemoteAgent, DisplayEvent } from '../remote';
@@ -21,32 +27,33 @@ import MessageBubble, { Message, MessageItem } from './MessageBubble';
 import InputBar, { ConfirmRequest } from './InputBar';
 import Footer from './Footer';
 import Welcome from './Welcome';
+import DiffView, { FileDiff } from './DiffView';
 import type { ConfirmResult } from '../confirm';
 import { commands } from '../commands/registry';
 import type { CommandContext } from '../commands/types';
 import { isYoloMode } from '../permissions';
 
-// ── Package version ───────────────────────────────────────────────────────────
-let PKG_VERSION = '0.2.0';
+// ── Package version ────────────────────────────────────────────────────────────
+let PKG_VERSION = '0.3.0';
 try {
   const pkgPath = path.join(__dirname, '..', 'package.json');
   const pkg     = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
   PKG_VERSION   = pkg.version ?? PKG_VERSION;
 } catch { /* no-op */ }
 
-// ── Git helpers ───────────────────────────────────────────────────────────────
-function readGitBranch(): string | undefined {
+// ── Git helpers ────────────────────────────────────────────────────────────────
+function readGitBranch(cwd: string): string | undefined {
   try {
-    const head = fs.readFileSync(path.join(process.cwd(), '.git', 'HEAD'), 'utf8').trim();
+    const head = fs.readFileSync(path.join(cwd, '.git', 'HEAD'), 'utf8').trim();
     const m    = head.match(/^ref:\s+refs\/heads\/(.+)$/);
     if (m) return m[1];
     if (/^[0-9a-f]{7,40}$/i.test(head)) return head.slice(0, 7);
   } catch { /* not a git repo */ }
   return undefined;
 }
-function readGitDirty(): Promise<boolean> {
+function readGitDirty(cwd: string): Promise<boolean> {
   return new Promise(resolve => {
-    execFile('git', ['status', '--porcelain'], { cwd: process.cwd(), timeout: 5000 }, (err, out) => {
+    execFile('git', ['status', '--porcelain'], { cwd, timeout: 5000 }, (err, out) => {
       resolve(!err && out.trim().length > 0);
     });
   });
@@ -65,19 +72,18 @@ function toolLabel(args: Record<string, unknown>): string {
   return String(args['path'] ?? args['command'] ?? args['title'] ?? '').slice(0, 60);
 }
 
-// ── Divider line ──────────────────────────────────────────────────────────────
+// ── Divider line ───────────────────────────────────────────────────────────────
 function Divider({ streaming }: { streaming: boolean }) {
   const cols  = process.stdout.columns ?? 80;
-  const char  = '─';
   const color = streaming ? '#22D3EE' : '#374151';
   return (
     <Box paddingX={1}>
-      <Text color={color}>{char.repeat(Math.max(1, cols - 2))}</Text>
+      <Text color={color}>{'─'.repeat(Math.max(1, cols - 2))}</Text>
     </Box>
   );
 }
 
-// ── Help message ──────────────────────────────────────────────────────────────
+// ── Help message ───────────────────────────────────────────────────────────────
 function makeHelpMessage(): Message {
   const lines: string[] = [
     'Available commands:',
@@ -102,6 +108,15 @@ function makeHelpMessage(): Message {
   };
 }
 
+// ── Reconnect config ───────────────────────────────────────────────────────────
+const RECONNECT_DELAYS = [1_000, 2_000, 5_000, 10_000, 20_000]; // ms per attempt
+
+// ── Static item types ──────────────────────────────────────────────────────────
+type StaticItem =
+  | { _type: 'welcome'; key: string; version: string; host: string; agent: string }
+  | { _type: 'message'; key: string; message: Message }
+  | { _type: 'diff';    key: string; diff: FileDiff };
+
 export default function App({ cfg, agents: initialAgents }: Props) {
   const { exit } = useApp();
 
@@ -109,7 +124,7 @@ export default function App({ cfg, agents: initialAgents }: Props) {
   const [currentAgent,     setCurrentAgent]     = useState<RemoteAgent>(
     () => initialAgents.find(a => a.status === 'active') ?? initialAgents[0]!,
   );
-  const [staticMessages,   setStaticMessages]   = useState<Message[]>([]);
+  const [staticItems,      setStaticItems]      = useState<StaticItem[]>([]);
   const [activeMessage,    setActiveMessage]    = useState<Message | null>(null);
   const [sessionId,        setSessionId]        = useState<string | undefined>();
   const [streaming,        setStreaming]        = useState(false);
@@ -118,45 +133,56 @@ export default function App({ cfg, agents: initialAgents }: Props) {
   const [error,            setError]            = useState<string | null>(null);
   const [stalled,          setStalled]          = useState(false);
   const [toolCount,        setToolCount]        = useState(0);
-  const [context]                               = useState(() => scanTree(process.cwd()));
+  const [cwd,              setCwd]              = useState(() => process.cwd());
   const [metaInfo,         setMetaInfo]         = useState<{
     tokensIn?: number; tokensOut?: number; costUsd?: number; model?: string;
   }>({});
   const [gitInfo,          setGitInfo]          = useState<{ branch?: string; dirty?: boolean }>({});
+  const [reconnectCount,   setReconnectCount]   = useState(0);
 
-  const toolTimers  = useRef(new Map<string, number>());
-  const chunkBuffer = useRef('');
-  const flushTimer  = useRef<NodeJS.Timeout | null>(null);
-  const activeRef   = useRef<Message | null>(null);
-  const abortRef    = useRef<AbortController | null>(null);
-  const lastUserRef = useRef<string | null>(null);
-  const staticRef   = useRef<Message[]>([]);
+  // context is re-derived whenever cwd changes
+  const context = useMemo(() => scanTree(cwd), [cwd]);
 
-  useEffect(() => { staticRef.current = staticMessages; }, [staticMessages]);
-  useEffect(() => { activeRef.current = activeMessage;  }, [activeMessage]);
+  const toolTimers    = useRef(new Map<string, number>());
+  const chunkBuffer   = useRef('');
+  const flushTimer    = useRef<NodeJS.Timeout | null>(null);
+  const activeRef     = useRef<Message | null>(null);
+  const abortRef      = useRef<AbortController | null>(null);
+  const lastUserRef   = useRef<string | null>(null);
+  const staticRef     = useRef<StaticItem[]>([]);
+  const itemCounter   = useRef(0);
+  const reconnectRef  = useRef(0);
+  const reconnecting  = useRef(false);
 
-  // ── Git status ────────────────────────────────────────────────────────────
+  useEffect(() => { staticRef.current = staticItems; }, [staticItems]);
+  useEffect(() => { activeRef.current = activeMessage; }, [activeMessage]);
+
+  function nextKey(): string {
+    return String(++itemCounter.current);
+  }
+
+  // ── Git status ─────────────────────────────────────────────────────────────
   useEffect(() => {
-    const branch = readGitBranch();
+    const branch = readGitBranch(cwd);
+    setGitInfo({ branch, dirty: undefined });
     if (!branch) return;
-    setGitInfo(prev => ({ ...prev, branch }));
     let cancelled = false;
     const refresh = async () => {
       if (cancelled) return;
-      const dirty = await readGitDirty();
+      const dirty = await readGitDirty(cwd);
       if (!cancelled) setGitInfo(prev => ({ ...prev, dirty }));
     };
     void refresh();
     const id = setInterval(() => { if (!streaming) void refresh(); }, 10_000);
     return () => { cancelled = true; clearInterval(id); };
-  }, [streaming]);
+  }, [cwd, streaming]);
 
-  // ── Confirm gate ──────────────────────────────────────────────────────────
+  // ── Confirm gate ────────────────────────────────────────────────────────────
   const handleConfirm = useCallback((command: string): Promise<ConfirmResult> => {
     return new Promise(resolve => setPendingConfirm({ command, resolve }));
   }, []);
 
-  // ── Active-message mutation ───────────────────────────────────────────────
+  // ── Active-message mutation ─────────────────────────────────────────────────
   const mutateActive = useCallback((mutator: (m: Message) => Message) => {
     setActiveMessage(prev => {
       if (!prev) return prev;
@@ -170,7 +196,7 @@ export default function App({ cfg, agents: initialAgents }: Props) {
     mutateActive(prev => ({ ...prev, items: [...prev.items, item] }));
   }, [mutateActive]);
 
-  // ── Streamed text batching (16ms = one ~60fps frame) ─────────────────────
+  // ── Streamed text batching (16ms = one ~60fps frame) ──────────────────────
   const flushChunkBuffer = useCallback(() => {
     flushTimer.current = null;
     const buffered = chunkBuffer.current;
@@ -191,8 +217,8 @@ export default function App({ cfg, agents: initialAgents }: Props) {
       } else {
         const finalized = combined.slice(0, newlineIdx + 1);
         const tail      = combined.slice(newlineIdx + 1);
-        for (const line of finalized.split(/(?<=\n)/)) {
-          if (line) items.push({ kind: 'text', content: line });
+        for (const line of finalized.split('\n')) {
+          items.push({ kind: 'text', content: line + '\n' });
         }
         if (tail) items.push({ kind: 'text', content: tail });
       }
@@ -207,7 +233,24 @@ export default function App({ cfg, agents: initialAgents }: Props) {
     }
   }, [flushChunkBuffer]);
 
-  // ── Display-event handler ─────────────────────────────────────────────────
+  // ── Diff extraction from tool_done ─────────────────────────────────────────
+  const tryExtractDiff = useCallback((preview: string | undefined, tool: string): FileDiff | null => {
+    if (tool !== 'fs_write' || !preview) return null;
+    try {
+      const parsed = JSON.parse(preview);
+      if (parsed && typeof parsed === 'object' && parsed.ok && parsed.path) {
+        return {
+          path:   parsed.path,
+          before: parsed.before ?? null,
+          after:  parsed.after  ?? '',
+          mode:   parsed.mode   ?? 'overwrite',
+        } as FileDiff;
+      }
+    } catch { /* not JSON or not a diff payload */ }
+    return null;
+  }, []);
+
+  // ── Display-event handler ───────────────────────────────────────────────────
   const handleDisplay = useCallback((e: DisplayEvent) => {
     switch (e.type) {
       case 'tool_call':
@@ -219,12 +262,15 @@ export default function App({ cfg, agents: initialAgents }: Props) {
           setToolCount(n => n + 1);
         }
         break;
+
       case 'tool_done':
         if (e.tool) {
           const key     = e.toolCallId ?? e.tool;
           const started = toolTimers.current.get(key);
           const dur     = started ? Date.now() - started : undefined;
           toolTimers.current.delete(key);
+
+          // Replace the running tool_call item with a tool_done item
           mutateActive(prev => ({
             ...prev,
             items: prev.items.map(item =>
@@ -232,11 +278,18 @@ export default function App({ cfg, agents: initialAgents }: Props) {
               (item.toolCallId === e.toolCallId || item.tool === e.tool) &&
               !prev.items.some(i => i.kind === 'tool_done' && i.toolCallId === e.toolCallId)
                 ? { kind: 'tool_done' as const, tool: e.tool!, durationMs: dur, toolCallId: e.toolCallId, outputPreview: e.preview }
-                : item
+                : item,
             ),
           }));
+
+          // If fs_write, extract diff and add it to the static feed
+          const diff = tryExtractDiff(e.preview, e.tool);
+          if (diff) {
+            setStaticItems(prev => [...prev, { _type: 'diff', key: nextKey(), diff }]);
+          }
         }
         break;
+
       case 'step_start':
         flushChunkBuffer();
         appendItem({ kind: 'step_start', stepIndex: e.stepIndex ?? 0, task: e.task ?? '', agentName: e.agentName ?? '' });
@@ -272,33 +325,24 @@ export default function App({ cfg, agents: initialAgents }: Props) {
         setMetaInfo({ tokensIn: e.tokensIn, tokensOut: e.tokensOut, costUsd: e.costUsd, model: e.model });
         break;
     }
-  }, [mutateActive, appendItem, flushChunkBuffer]);
+  }, [mutateActive, appendItem, flushChunkBuffer, tryExtractDiff]);
 
-  // ── Submit ────────────────────────────────────────────────────────────────
-  const handleSubmit = useCallback(async (text: string) => {
-    if (streaming) return;
-    lastUserRef.current = text;
-    setError(null);
-    setStalled(false);
-    setStreaming(true);
-    setToolCount(0);
-
-    const userMsg: Message = { role: 'user', items: [{ kind: 'text', content: text }] };
-    setStaticMessages(prev => [...prev, userMsg]);
-
-    const agentMsg: Message = { role: 'agent', agentName: currentAgent.name, items: [] };
-    setActiveMessage(agentMsg);
+  // ── Core send (used by submit + reconnect) ─────────────────────────────────
+  const sendMessage = useCallback(async (
+    text:      string,
+    sid:       string | undefined,
+    agentMsg:  Message,
+    abort:     AbortController,
+    attempt:   number,
+  ): Promise<void> => {
     activeRef.current = agentMsg;
-
-    const abort = new AbortController();
-    abortRef.current = abort;
 
     try {
       await chat({
         url:      cfg.url,
         token:    cfg.token,
         message:  text,
-        sessionId,
+        sessionId: sid,
         agentId:  currentAgent.id,
         context,
         signal:   abort.signal,
@@ -306,9 +350,76 @@ export default function App({ cfg, agents: initialAgents }: Props) {
         onStallClear: () => setStalled(false),
         onConfirm:  handleConfirm,
         onChunk:    appendChunk,
-        onSession:  (sid) => setSessionId(sid),
+        onSession:  (id) => setSessionId(id),
         onDisplay:  handleDisplay,
       });
+      // Clean success — reset reconnect counter
+      reconnectRef.current = 0;
+      setReconnectCount(0);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+
+      // User-initiated abort — don't reconnect
+      if (msg === 'cancelled by user' || abort.signal.aborted) throw err;
+
+      // Network-level drop — attempt reconnect
+      const isNetworkError = msg.startsWith('socket hang up') ||
+        msg.startsWith('ECONNRESET') ||
+        msg.startsWith('ECONNREFUSED') ||
+        msg.startsWith('ETIMEDOUT') ||
+        msg.includes('network') ||
+        msg.startsWith('HTTP_5');
+
+      if (isNetworkError && attempt < RECONNECT_DELAYS.length) {
+        const delay = RECONNECT_DELAYS[attempt]!;
+        reconnectRef.current = attempt + 1;
+        setReconnectCount(attempt + 1);
+        reconnecting.current = true;
+
+        // Notify user
+        mutateActive(prev => ({
+          ...prev,
+          items: [...prev.items, {
+            kind: 'text' as const,
+            content: `\n⟳ Connection dropped. Reconnecting in ${delay / 1000}s… (attempt ${attempt + 1}/${RECONNECT_DELAYS.length})\n`,
+          }],
+        }));
+
+        await new Promise(r => setTimeout(r, delay));
+        if (abort.signal.aborted) { reconnecting.current = false; throw err; }
+        reconnecting.current = false;
+
+        return sendMessage(text, sid, agentMsg, abort, attempt + 1);
+      }
+
+      throw err;
+    }
+  }, [cfg, currentAgent, context, appendChunk, handleConfirm, handleDisplay, mutateActive]);
+
+  // ── Submit ─────────────────────────────────────────────────────────────────
+  const handleSubmit = useCallback(async (text: string) => {
+    if (streaming) return;
+    lastUserRef.current = text;
+    setError(null);
+    setStalled(false);
+    setStreaming(true);
+    setToolCount(0);
+    reconnectRef.current = 0;
+    setReconnectCount(0);
+
+    const userMsg: Message = { role: 'user', items: [{ kind: 'text', content: text }] };
+    setStaticItems(prev => [...prev, { _type: 'message', key: nextKey(), message: userMsg }]);
+
+    const agentMsg: Message = { role: 'agent', agentName: currentAgent.name, items: [] };
+    setActiveMessage(agentMsg);
+    activeRef.current = agentMsg;
+
+    const abort = new AbortController();
+    abortRef.current = abort;
+    const snapSessionId = sessionId;
+
+    try {
+      await sendMessage(text, snapSessionId, agentMsg, abort, 0);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg !== 'cancelled by user') {
@@ -319,105 +430,154 @@ export default function App({ cfg, agents: initialAgents }: Props) {
       if (flushTimer.current) { clearTimeout(flushTimer.current); flushTimer.current = null; }
       flushChunkBuffer();
       const finished = activeRef.current;
-      if (finished) setStaticMessages(prev => [...prev, finished]);
+      if (finished && finished.items.length > 0) {
+        setStaticItems(prev => [...prev, { _type: 'message', key: nextKey(), message: finished }]);
+      }
       setActiveMessage(null);
       activeRef.current  = null;
       abortRef.current   = null;
       setStreaming(false);
       setStalled(false);
+      reconnecting.current = false;
     }
-  }, [streaming, sessionId, currentAgent, cfg, context, appendChunk, handleConfirm, handleDisplay, flushChunkBuffer, mutateActive]);
+  }, [streaming, sessionId, currentAgent, sendMessage, flushChunkBuffer, mutateActive]);
 
-  // ── Abort ─────────────────────────────────────────────────────────────────
+  // ── Abort ──────────────────────────────────────────────────────────────────
   const handleAbort = useCallback(() => { abortRef.current?.abort(); }, []);
 
-  // ── Agent picker ──────────────────────────────────────────────────────────
+  // ── Agent picker ───────────────────────────────────────────────────────────
   const handleAgentSelected = useCallback(async (n: number) => {
     setPendingAgentPick(false);
     const active = agents.filter(a => a.status === 'active');
     const chosen = active[n - 1];
     if (!chosen) return;
     setCurrentAgent(chosen);
-    setStaticMessages(prev => [...prev, {
-      role:      'agent',
-      agentName: 'nclaw',
-      items:     [{ kind: 'text', content: `Switched to ${chosen.name}` }],
+    setStaticItems(prev => [...prev, {
+      _type:   'message',
+      key:     nextKey(),
+      message: {
+        role:      'agent',
+        agentName: 'nclaw',
+        items:     [{ kind: 'text', content: `Switched to ${chosen.name}` }],
+      },
     }]);
   }, [agents]);
 
-  // ── Command context ───────────────────────────────────────────────────────
+  // ── Command context ────────────────────────────────────────────────────────
   const cmdCtx = useMemo<CommandContext>(() => ({
     submit:        handleSubmit,
-    clearScreen:   () => setStaticMessages([]),
+    clearScreen:   () => setStaticItems([]),
     openAgentPick: () => setPendingAgentPick(true),
     exit:          () => exit(),
     retryLast:     () => { if (lastUserRef.current) void handleSubmit(lastUserRef.current); },
-    newSession:    () => {
+    newSession: () => {
       setSessionId(undefined);
-      setStaticMessages([]);
+      setStaticItems([]);
       setMetaInfo({});
       setToolCount(0);
     },
     setCwdDisplay: () => {},
+
+    // /cd — change cwd mid-session
+    changeCwd: (dir: string) => {
+      setCwd(dir);
+    },
+
+    // /files — list inline (handled in registry, uses emitSystem)
+    listCwd: async () => {},
+
     getLastAgentMessage: () => {
-      const msgs = [...staticRef.current];
-      for (let i = msgs.length - 1; i >= 0; i--) {
-        if (msgs[i]!.role === 'agent') {
-          return msgs[i]!.items
-            .filter(item => item.kind === 'text')
-            .map(item => (item as { content: string }).content)
+      const items = [...staticRef.current];
+      for (let i = items.length - 1; i >= 0; i--) {
+        const item = items[i]!;
+        if (item._type === 'message' && item.message.role === 'agent') {
+          return item.message.items
+            .filter(it => it.kind === 'text')
+            .map(it => (it as { content: string }).content)
             .join('');
         }
       }
       return null;
     },
+
     emitSystem: (text: string) => {
       if (text === '__internal_help__') {
-        setStaticMessages(prev => [...prev, makeHelpMessage()]);
+        setStaticItems(prev => [...prev, { _type: 'message', key: nextKey(), message: makeHelpMessage() }]);
         return;
       }
-      setStaticMessages(prev => [...prev, {
-        role:      'agent',
-        agentName: 'nclaw',
-        items:     [{ kind: 'text', content: text }],
+      setStaticItems(prev => [...prev, {
+        _type:   'message',
+        key:     nextKey(),
+        message: {
+          role:      'agent',
+          agentName: 'nclaw',
+          items:     [{ kind: 'text', content: text }],
+        },
       }]);
     },
+
     emitLines: (lines: string[]) => {
-      setStaticMessages(prev => [
+      setStaticItems(prev => [
         ...prev,
         ...lines.map(line => ({
-          role:      'agent' as const,
-          agentName: 'nclaw',
-          items:     [{ kind: 'text' as const, content: line }],
+          _type:   'message' as const,
+          key:     nextKey(),
+          message: {
+            role:      'agent' as const,
+            agentName: 'nclaw',
+            items:     [{ kind: 'text' as const, content: line }],
+          },
         })),
       ]);
     },
   }), [handleSubmit, exit]);
 
-  // ── Render ────────────────────────────────────────────────────────────────
+  // ── Render ─────────────────────────────────────────────────────────────────
   const host = getHost(cfg.url);
+
+  // Build initial welcome item once
+  const welcomeItem = useMemo<StaticItem>(() => ({
+    _type:   'welcome',
+    key:     'welcome',
+    version: PKG_VERSION,
+    host,
+    agent:   currentAgent.name,
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), []);
+
+  const allStaticItems = useMemo<StaticItem[]>(
+    () => [welcomeItem, ...staticItems],
+    [welcomeItem, staticItems],
+  );
 
   return (
     // NO fixed height — let the terminal scroll naturally.
-    // flexDirection=column is still needed so Static + live + chrome stack vertically.
     <Box flexDirection="column">
-      {/* ── Scrollback: welcome splash + committed messages ────────────── */}
-      <Static items={[
-        { _type: 'welcome' as const },
-        ...staticMessages.map((m, i) => ({ _type: 'msg' as const, m, i })),
-      ]}>
+
+      {/* ── Scrollback: welcome splash + committed messages + diffs ───── */}
+      <Static items={allStaticItems}>
         {(item) => {
           if (item._type === 'welcome') {
             return (
               <Welcome
-                key="welcome"
-                version={PKG_VERSION}
-                host={host}
-                agentName={currentAgent.name}
+                key={item.key}
+                version={item.version}
+                host={item.host}
+                agentName={item.agent}
               />
             );
           }
-          return <MessageBubble key={`msg-${item.i}`} message={item.m} />;
+          if (item._type === 'diff') {
+            return <DiffView key={item.key} diff={item.diff} />;
+          }
+          // message
+          return (
+            <MessageBubble
+              key={item.key}
+              message={item.message}
+              isStreaming={false}
+            />
+          );
         }}
       </Static>
 
@@ -426,35 +586,38 @@ export default function App({ cfg, agents: initialAgents }: Props) {
         <MessageBubble message={activeMessage} isStreaming={streaming} />
       )}
 
-      {/* ── Bottom chrome — always visible at cursor position ─────────── */}
-      <Divider streaming={streaming} />
+      {/* ── Error banner ──────────────────────────────────────────────── */}
+      {error && !streaming && (
+        <Box paddingX={2} marginY={0}>
+          <Text color="#EF4444">  ✗ {error}</Text>
+        </Box>
+      )}
 
+      {/* ── Divider + input + footer ───────────────────────────────────── */}
+      <Divider streaming={streaming} />
       <InputBar
         streaming={streaming}
+        stalled={stalled}
+        error={error}
         pendingConfirm={pendingConfirm}
         pendingAgentPick={pendingAgentPick}
         agents={agents}
-        error={error}
-        stalled={stalled}
-        onSubmit={(t) => void handleSubmit(t)}
+        onSubmit={handleSubmit}
         onAbort={handleAbort}
-        onConfirmResolve={(r) => {
-          const pending = pendingConfirm;
+        onConfirmResolve={(r: import('../confirm').ConfirmResult) => {
+          pendingConfirm?.resolve(r);
           setPendingConfirm(null);
-          pending?.resolve(r);
         }}
         onAgentPick={() => setPendingAgentPick(true)}
         onAgentSelected={handleAgentSelected}
         onExit={() => exit()}
         cmdCtx={cmdCtx}
       />
-
       <Footer
-        cwd={process.cwd()}
+        cwd={cwd}
         agentName={currentAgent.name}
         host={host}
         streaming={streaming}
-        stalled={stalled}
         toolCount={toolCount}
         sessionId={sessionId}
         tokensIn={metaInfo.tokensIn}
@@ -464,6 +627,8 @@ export default function App({ cfg, agents: initialAgents }: Props) {
         branch={gitInfo.branch}
         dirty={gitInfo.dirty}
         yolo={isYoloMode()}
+        stalled={stalled}
+        reconnect={reconnectCount > 0 ? reconnectCount : undefined}
       />
     </Box>
   );

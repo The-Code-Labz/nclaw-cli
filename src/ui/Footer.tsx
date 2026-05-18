@@ -1,24 +1,29 @@
 /**
  * Footer status bar — always shown at the bottom.
+ *
+ * v0.3.0 additions:
+ *   - reconnect indicator — shows "↻ N" when auto-reconnect is in progress
+ *   - cwd updates when /cd changes the working directory
  */
 import { Box, Text } from 'ink';
 import { theme } from './theme';
 
 interface Props {
-  cwd:        string;
-  agentName:  string;
-  host:       string;
-  streaming:  boolean;
-  toolCount:  number;
-  sessionId?: string;
-  tokensIn?:  number;
-  tokensOut?: number;
-  costUsd?:   number;
-  model?:     string;
-  branch?:    string;
-  dirty?:     boolean;
-  yolo?:      boolean;
-  stalled?:   boolean;
+  cwd:         string;
+  agentName:   string;
+  host:        string;
+  streaming:   boolean;
+  toolCount:   number;
+  sessionId?:  string;
+  tokensIn?:   number;
+  tokensOut?:  number;
+  costUsd?:    number;
+  model?:      string;
+  branch?:     string;
+  dirty?:      boolean;
+  yolo?:       boolean;
+  stalled?:    boolean;
+  reconnect?:  number;  // > 0 = currently reconnecting (attempt N)
 }
 
 function fmtTokens(n: number): string {
@@ -39,7 +44,7 @@ function Sep() {
 
 export default function Footer({
   cwd, agentName, host, streaming, toolCount, sessionId,
-  tokensIn, tokensOut, costUsd, model, branch, dirty, yolo, stalled,
+  tokensIn, tokensOut, costUsd, model, branch, dirty, yolo, stalled, reconnect,
 }: Props) {
   const home    = process.env.HOME ?? '';
   const display = home && cwd.startsWith(home) ? '~' + cwd.slice(home.length) : cwd;
@@ -47,9 +52,10 @@ export default function Footer({
 
   // Status indicator
   let statusColor: string = theme.success;
-  let statusChar  = '●';
-  if (stalled)   { statusColor = theme.warning; statusChar = '◌'; }
-  if (streaming) { statusColor = theme.accent;  statusChar = '◉'; }
+  let statusChar          = '●';
+  if (reconnect != null && reconnect > 0) { statusColor = theme.warning; statusChar = '↻'; }
+  else if (stalled)                        { statusColor = theme.warning; statusChar = '◌'; }
+  else if (streaming)                      { statusColor = theme.accent;  statusChar = '◉'; }
 
   // Session ID (last 8 chars)
   const shortSid = sessionId ? sessionId.slice(-8) : null;
@@ -77,7 +83,13 @@ export default function Footer({
             <Sep />
           </>
         )}
-        {stalled && (
+        {reconnect != null && reconnect > 0 && (
+          <>
+            <Text color={theme.warning}>↻ reconnect {reconnect}</Text>
+            <Sep />
+          </>
+        )}
+        {stalled && !(reconnect != null && reconnect > 0) && (
           <>
             <Text color={theme.warning}>stalled</Text>
             <Sep />

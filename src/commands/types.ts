@@ -14,6 +14,10 @@ export interface CommandContext {
   emitSystem:    (text: string) => void;
   /** Stream lines into the transcript in real time (for /update). */
   emitLines:     (lines: string[]) => void;
+  /** Change the process working directory and update footer. */
+  changeCwd:     (dir: string) => void;
+  /** List the current working directory and emit inline. */
+  listCwd:       () => Promise<void>;
 }
 
 export type CommandCategory = 'session' | 'agent' | 'system' | 'help';

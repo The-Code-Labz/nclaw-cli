@@ -1,8 +1,10 @@
+import fs   from 'fs/promises';
+import path  from 'path';
 import { spawn } from 'child_process';
 import type { Command } from './types';
 import { runUpdate } from '../updater';
 
-// ── Clipboard helpers ────────────────────────────────────────────────────────
+// ── Clipboard helpers ─────────────────────────────────────────────────────────
 function copyToClipboard(text: string): Promise<boolean> {
   const candidates: Array<{ cmd: string; args: string[] }> = [
     { cmd: 'pbcopy',  args: [] },
@@ -29,68 +31,163 @@ function copyToClipboard(text: string): Promise<boolean> {
   });
 }
 
-// ── Commands ─────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/** Format a directory listing into a compact multi-column display. */
+async function buildFileListing(dir: string): Promise<string> {
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+
+  const sorted = [...entries].sort((a, b) => {
+    // Directories first, then files, each alphabetically
+    const aDir = a.isDirectory() ? 0 : 1;
+    const bDir = b.isDirectory() ? 0 : 1;
+    if (aDir !== bDir) return aDir - bDir;
+    return a.name.localeCompare(b.name);
+  });
+
+  const lines: string[] = [`  ${dir}`, ''];
+
+  const cols  = process.stdout.columns ?? 80;
+  const max   = sorted.reduce((m, e) => Math.max(m, e.name.length + (e.isDirectory() ? 1 : 0)), 0);
+  const colW  = max + 3;
+  const nCols = Math.max(1, Math.floor((cols - 4) / colW));
+
+  const rows: string[] = [];
+  for (let i = 0; i < sorted.length; i += nCols) {
+    const row = sorted.slice(i, i + nCols);
+    rows.push(
+      '  ' + row.map(e => {
+        const name = e.isDirectory() ? e.name + '/' : e.name;
+        return name.padEnd(colW);
+      }).join('').trimEnd(),
+    );
+  }
+  lines.push(...rows);
+  lines.push('', `  ${sorted.length} item${sorted.length !== 1 ? 's' : ''}`);
+  return lines.join('\n');
+}
+
+// ── Commands ──────────────────────────────────────────────────────────────────
 
 export const commands: Command[] = [
   {
-    name: 'help',
-    slash: '/help',
+    name:        'help',
+    slash:       '/help',
     description: 'Show available commands',
-    category: 'help',
+    category:    'help',
     run: (ctx) => { ctx.emitSystem('__internal_help__'); },
   },
   {
-    name: 'clear',
-    slash: '/clear',
-    aliases: ['/cls'],
+    name:        'clear',
+    slash:       '/clear',
+    aliases:     ['/cls'],
     description: 'Clear the screen',
-    category: 'session',
+    category:    'session',
     run: (ctx) => ctx.clearScreen(),
   },
   {
-    name: 'new',
-    slash: '/new',
+    name:        'new',
+    slash:       '/new',
     description: 'Start a new session',
-    category: 'session',
+    category:    'session',
     run: (ctx) => ctx.newSession(),
   },
   {
-    name: 'agent',
-    slash: '/agent',
+    name:        'agent',
+    slash:       '/agent',
     description: 'Switch agent',
-    category: 'agent',
+    category:    'agent',
     run: (ctx) => ctx.openAgentPick(),
   },
   {
-    name: 'retry',
-    slash: '/retry',
+    name:        'retry',
+    slash:       '/retry',
     description: 'Re-send the last user message',
-    category: 'session',
+    category:    'session',
     run: (ctx) => ctx.retryLast(),
   },
   {
-    name: 'exit',
-    slash: '/exit',
-    aliases: ['/quit'],
+    name:        'exit',
+    slash:       '/exit',
+    aliases:     ['/quit'],
     description: 'Exit nclaw',
-    category: 'system',
+    category:    'system',
     run: (ctx) => ctx.exit(),
   },
+
+  // ── /cwd ────────────────────────────────────────────────────────────────────
   {
-    name: 'cwd',
-    slash: '/cwd',
+    name:        'cwd',
+    slash:       '/cwd',
     description: 'Print current working directory',
-    category: 'system',
+    category:    'system',
     run: (ctx) => {
-      ctx.emitSystem(process.cwd());
-      ctx.setCwdDisplay(process.cwd());
+      const cwd = process.cwd();
+      ctx.emitSystem(cwd);
+      ctx.setCwdDisplay(cwd);
     },
   },
+
+  // ── /cd ─────────────────────────────────────────────────────────────────────
   {
-    name: 'copy',
-    slash: '/copy',
+    name:        'cd',
+    slash:       '/cd',
+    description: 'Change working directory  (e.g. /cd ~/projects/my-app)',
+    category:    'system',
+    run: (ctx, args) => {
+      const raw = args.join(' ').trim();
+
+      // No argument → go home
+      const target = raw
+        ? raw.replace(/^~/, process.env.HOME ?? process.env.USERPROFILE ?? '~')
+        : (process.env.HOME ?? process.env.USERPROFILE ?? process.cwd());
+
+      const resolved = path.resolve(process.cwd(), target);
+
+      try {
+        const stat = require('fs').statSync(resolved);       // sync intentional — this is a CLI cmd
+        if (!stat.isDirectory()) {
+          ctx.emitSystem(`/cd: not a directory: ${resolved}`);
+          return;
+        }
+        process.chdir(resolved);
+        ctx.changeCwd(resolved);
+        ctx.emitSystem(`  → ${resolved}`);
+      } catch (e) {
+        ctx.emitSystem(`/cd: ${(e as Error).message}`);
+      }
+    },
+  },
+
+  // ── /files ───────────────────────────────────────────────────────────────────
+  {
+    name:        'files',
+    slash:       '/files',
+    aliases:     ['/ls'],
+    description: 'List current directory inline',
+    category:    'system',
+    run: async (ctx, args) => {
+      const raw      = args.join(' ').trim();
+      const target   = raw
+        ? raw.replace(/^~/, process.env.HOME ?? process.env.USERPROFILE ?? '~')
+        : process.cwd();
+      const resolved = path.resolve(process.cwd(), target);
+
+      try {
+        const listing = await buildFileListing(resolved);
+        ctx.emitSystem(listing);
+      } catch (e) {
+        ctx.emitSystem(`/files: ${(e as Error).message}`);
+      }
+    },
+  },
+
+  // ── /copy ────────────────────────────────────────────────────────────────────
+  {
+    name:        'copy',
+    slash:       '/copy',
     description: 'Copy last assistant message to clipboard',
-    category: 'session',
+    category:    'session',
     run: async (ctx) => {
       const last = ctx.getLastAgentMessage();
       if (!last) { ctx.emitSystem('No assistant message to copy.'); return; }
@@ -101,18 +198,22 @@ export const commands: Command[] = [
       );
     },
   },
+
+  // ── /sessions ────────────────────────────────────────────────────────────────
   {
-    name: 'sessions',
-    slash: '/sessions',
+    name:        'sessions',
+    slash:       '/sessions',
     description: 'List sessions (not yet implemented)',
-    category: 'session',
+    category:    'session',
     run: (ctx) => ctx.emitSystem('/sessions: not yet implemented'),
   },
+
+  // ── /permissions ─────────────────────────────────────────────────────────────
   {
-    name: 'permissions',
-    slash: '/permissions',
+    name:        'permissions',
+    slash:       '/permissions',
     description: 'Show tool allowlist',
-    category: 'system',
+    category:    'system',
     run: (ctx) => {
       try {
         // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -131,18 +232,20 @@ export const commands: Command[] = [
       }
     },
   },
+
+  // ── /update ──────────────────────────────────────────────────────────────────
   {
-    name: 'update',
-    slash: '/update',
+    name:        'update',
+    slash:       '/update',
     description: 'Pull latest nclaw from GitHub and rebuild',
-    category: 'system',
+    category:    'system',
     run: async (ctx) => {
       ctx.emitSystem('Starting update…');
       try {
         const gen = runUpdate();
         let result = await gen.next();
         while (!result.done) {
-          const line = result.value;
+          const line   = result.value;
           const prefix =
             line.stream === 'info'   ? '  → ' :
             line.stream === 'error'  ? '  ✗ ' :

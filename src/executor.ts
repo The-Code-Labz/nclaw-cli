@@ -6,12 +6,16 @@
  *   NOT a constant frozen at module load. This means:
  *     - If the user runs `nclaw` in ~/my-project, all fs_read/write/list
  *       and bash_run ops happen in ~/my-project on THEIR machine.
- *     - If they `cd` or the process cwd changes, subsequent calls reflect that.
+ *     - If they `/cd` to a new dir, subsequent calls reflect that immediately.
  *
  *   The server-side agent sees the client cwd through the `context` field
  *   (injected by scanTree). The agent then issues tool calls that come back
  *   here to execute locally. This is the same model as Claude Code's
  *   local tool relay.
+ *
+ * Diff support:
+ *   fs_write returns an extended payload with { ok, path, bytes, before, after, mode }
+ *   so the TUI can render an inline diff without a second file read.
  *
  * safePath() is intentionally loose — it resolves relative paths against
  * the live cwd and only blocks actual path-traversal escapes (../ above root).
@@ -19,7 +23,7 @@
  * (e.g. writing to ~/Desktop, reading /etc/hosts) need to work.
  * The bash_run confirmation gate is the primary safety boundary.
  */
-import fs from 'fs/promises';
+import fs   from 'fs/promises';
 import path from 'path';
 import { execFile, spawn } from 'child_process';
 import type { ConfirmResult } from './confirm';
@@ -36,8 +40,8 @@ function getCwd(): string {
 }
 
 function resolvePath(p: string): string {
-  // If already absolute, use as-is. Otherwise resolve against live cwd.
-  return path.isAbsolute(p) ? p : path.resolve(getCwd(), p);
+  const expanded = p.replace(/^~/, process.env.HOME ?? process.env.USERPROFILE ?? '~');
+  return path.isAbsolute(expanded) ? expanded : path.resolve(getCwd(), expanded);
 }
 
 export async function executeToolCall(
@@ -47,7 +51,7 @@ export async function executeToolCall(
 ): Promise<string> {
   switch (tool) {
 
-    // ── fs_read ─────────────────────────────────────────────────────────────
+    // ── fs_read ───────────────────────────────────────────────────────────────
     case 'fs_read': {
       const p = resolvePath(args['path'] as string);
       try {
@@ -57,28 +61,43 @@ export async function executeToolCall(
       }
     }
 
-    // ── fs_write ────────────────────────────────────────────────────────────
+    // ── fs_write ──────────────────────────────────────────────────────────────
+    // Returns { ok, path, bytes, before, after, mode } so the TUI can diff.
     case 'fs_write': {
       const p       = resolvePath(args['path'] as string);
       const content = args['content'] as string;
       const mode    = (args['mode'] as string | undefined) ?? 'overwrite';
+
+      // Read existing content for diff (null = new file)
+      let before: string | null = null;
+      try { before = await fs.readFile(p, 'utf8'); } catch { /* new file */ }
+
       try {
         await fs.mkdir(path.dirname(p), { recursive: true });
         if (mode === 'append') {
           await fs.appendFile(p, content, 'utf8');
         } else if (mode === 'create') {
-          // Fail if file exists
           await fs.writeFile(p, content, { encoding: 'utf8', flag: 'wx' });
         } else {
           await fs.writeFile(p, content, 'utf8');
         }
-        return JSON.stringify({ ok: true, path: p, bytes: Buffer.byteLength(content) });
+
+        const after = mode === 'append' ? (before ?? '') + content : content;
+
+        return JSON.stringify({
+          ok:     true,
+          path:   p,
+          bytes:  Buffer.byteLength(content),
+          before,
+          after,
+          mode: (before === null && mode !== 'append') ? 'create' : mode,
+        });
       } catch (e) {
         return JSON.stringify({ error: `fs_write failed: ${(e as Error).message}`, path: p });
       }
     }
 
-    // ── fs_list ─────────────────────────────────────────────────────────────
+    // ── fs_list ───────────────────────────────────────────────────────────────
     case 'fs_list': {
       const rawPath = (args['path'] as string | undefined) ?? '.';
       const p       = resolvePath(rawPath);
@@ -92,23 +111,21 @@ export async function executeToolCall(
       }
     }
 
-    // ── fs_search ───────────────────────────────────────────────────────────
+    // ── fs_search ─────────────────────────────────────────────────────────────
     case 'fs_search': {
-      const pattern  = args['pattern'] as string;
-      const rawPath  = (args['path'] as string | undefined) ?? '.';
-      const p        = resolvePath(rawPath);
-      const maxRes   = (args['max_results'] as number | undefined) ?? 50;
-      const cwd      = getCwd();
+      const pattern = args['pattern'] as string;
+      const rawPath = (args['path'] as string | undefined) ?? '.';
+      const p       = resolvePath(rawPath);
+      const maxRes  = (args['max_results'] as number | undefined) ?? 50;
+      const cwd     = getCwd();
 
       return new Promise<string>(resolve => {
-        // Use ripgrep if available, fall back to grep
         const rg = spawn('rg', ['--line-number', '--no-heading', '-e', pattern, p], {
           cwd, stdio: ['ignore', 'pipe', 'ignore'],
         });
         let out = '';
         rg.stdout.on('data', (d: Buffer) => { out += d.toString(); });
         rg.on('error', () => {
-          // rg not available — try grep
           const grep = spawn('grep', ['-rn', pattern, p], {
             cwd, stdio: ['ignore', 'pipe', 'ignore'],
           });
@@ -127,7 +144,7 @@ export async function executeToolCall(
       });
     }
 
-    // ── bash_run ────────────────────────────────────────────────────────────
+    // ── bash_run ──────────────────────────────────────────────────────────────
     case 'bash_run': {
       const cmd          = args['command'] as string;
       const cwd          = getCwd();
@@ -142,7 +159,7 @@ export async function executeToolCall(
       if (isBackground) {
         const child = spawn('bash', ['-c', cmd], { cwd, stdio: 'ignore', detached: true });
         child.unref();
-        return JSON.stringify({ stdout: '[started in background]', stderr: '', exit_code: 0 });
+        return JSON.stringify({ stdout: '[started in background]', stderr: '', exit_code: 0, cwd });
       }
 
       return new Promise<string>((resolve) => {
@@ -153,7 +170,7 @@ export async function executeToolCall(
           { cwd, timeout: BASH_TIMEOUT_MS, killSignal: 'SIGTERM', maxBuffer: 10 * 1024 * 1024 },
           (err, stdout, stderr) => {
             if (resolved) return;
-            resolved  = true;
+            resolved   = true;
             const exitCode = err
               ? ((err as NodeJS.ErrnoException).code != null
                   ? (err as NodeJS.ErrnoException).code
