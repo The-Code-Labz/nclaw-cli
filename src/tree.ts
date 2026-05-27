@@ -14,39 +14,32 @@ const IGNORE_EXTS = new Set([
 
 export function scanTree(dir: string, maxDepth = 4): string {
   const lines: string[] = [
-    // ── Critical context the agent MUST understand ──────────────────────────
-    `CLIENT WORKING DIRECTORY: ${dir}`,
-    ``,
-    `IMPORTANT — YOU ARE CONNECTED VIA THE NCLAW CLI TOOL:`,
-    `- The user is running nclaw on their own machine in the directory above.`,
-    `- ALL file operations (fs_read, fs_write, fs_list, fs_search) execute ON THE USER'S MACHINE in "${dir}".`,
-    `- ALL bash_run commands execute ON THE USER'S MACHINE in "${dir}".`,
-    `- When you create files, they are created at "${dir}/<filename>" on the user's machine.`,
-    `- NEVER prefix commands with "cd ${dir} &&" — the cwd is already set to that directory.`,
-    `- NEVER use absolute paths like /home/neuroclaw-v1/... — use relative paths like ./filename or just filename.`,
-    `- The NeuroClaw server is separate from the user's machine. Do not confuse them.`,
-    ``,
-    `WORKFLOW: For any implementation task follow this order — (1) Plan; (2) Execute: write all code/files completely; (3) Test: run the dev server or test command; (4) Debug: fix errors in the same response; (5) Ship: only declare done once verified.`,
-    `HANDOFF: End every completed task with: WHAT WAS BUILT · FILES (each file + role) · HOW TO RUN · WALKTHROUGH · HONEST NOTES`,
+    `Working directory: ${dir}`,
+    `IMPORTANT: bash_run commands execute with cwd already set to this directory. Run commands directly — never prefix with \`cd ${dir} &&\` or \`cd /path &&\`.`,
+    `IMPORTANT: When executing a multi-step task, complete the full task in a single response. Do NOT stop mid-task to ask "shall I continue?". Use tools iteratively until done. Only stop if blocked by missing information you cannot discover yourself.`,
+    `WORKFLOW: For any implementation task follow this order — (1) Plan: state what you'll build and how; (2) Execute: write all code and files completely; (3) Test: run the dev server or test command and capture real output; (4) Debug: if there are errors, fix them in the same response before moving on; (5) Ship: only declare done once you've verified it runs.`,
+    `HANDOFF: After every completed task, end your response with a structured walkthrough the user can follow. Use this exact format:\n  WHAT WAS BUILT — 1-2 sentence description of what you built and the problem it solves\n  FILES — list every file created or modified with a one-line description of its role\n  HOW TO RUN — the exact command(s) to start or use it\n  WALKTHROUGH — describe what the user will actually see and interact with, screen by screen or feature by feature\n  HONEST NOTES — anything that isn't perfect yet, known limitations, or what you'd tackle next\nThis walkthrough is mandatory. Never skip it. The user needs to understand what was built without reading the code.`,
   ];
 
-  // Inject AGENT.md if present
+  // Inject AGENT.md if the project has one
   const agentMdPath = path.join(dir, 'AGENT.md');
   try {
     const agentMd = fs.readFileSync(agentMdPath, 'utf8').trim();
     if (agentMd) {
       lines.push('', '=== AGENT.md (project context) ===', agentMd, '=== end AGENT.md ===');
     }
-  } catch { /* not present */ }
+  } catch { /* not present, skip */ }
 
-  lines.push('', `File tree of ${dir}:`);
+  lines.push('', 'File tree:');
 
   function walk(current: string, prefix: string, depth: number): void {
     if (depth > maxDepth) return;
     let entries: fs.Dirent[];
-    try { entries = fs.readdirSync(current, { withFileTypes: true }); }
-    catch { return; }
-
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
     const visible = entries.filter((e) => {
       if (IGNORE_NAMES.has(e.name)) return false;
       if (e.name.startsWith('.') && e.name !== '.env.example') return false;
@@ -104,6 +97,12 @@ This file is read by nclaw AI agents on every turn. Fill in the sections below s
 
 <!-- Any special constraints or instructions for the AI working in this project -->
 - Always run and verify your code before reporting done
-- Use relative paths for all file operations
-- After every completed task, end with a full walkthrough
+- If the dev server or tests show errors, fix them in the same response before finishing
+- After every completed task, end with a full walkthrough:
+    WHAT WAS BUILT — what you built and the problem it solves
+    FILES — every file created/modified and its role
+    HOW TO RUN — exact command(s) to start or use it
+    WALKTHROUGH — what the user will see and interact with
+    HONEST NOTES — limitations, known issues, what to tackle next
 `;
+

@@ -12,6 +12,21 @@ const HISTORY_PATH = path.join(HISTORY_DIR, 'history.json');
 
 let cache: string[] | null = null;
 
+function ensureSecureDir(dir: string): void {
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } catch { /* ignore */ }
+}
+
+function secureWrite(filePath: string, data: string): void {
+  ensureSecureDir(path.dirname(filePath));
+  try {
+    fs.writeFileSync(filePath, data, { mode: 0o600 });
+  } catch {
+    fs.writeFileSync(filePath, data);
+  }
+}
+
 export function loadHistory(): string[] {
   if (cache) return cache;
   try {
@@ -26,8 +41,7 @@ export function loadHistory(): string[] {
 export function saveHistory(entries: string[]): void {
   cache = entries.slice(0, MAX_ENTRIES);
   try {
-    fs.mkdirSync(HISTORY_DIR, { recursive: true });
-    fs.writeFileSync(HISTORY_PATH, JSON.stringify(cache, null, 0), 'utf8');
+    secureWrite(HISTORY_PATH, JSON.stringify(cache, null, 0));
   } catch { /* non-fatal */ }
 }
 

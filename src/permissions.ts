@@ -26,6 +26,21 @@ const PERMS_PATH = path.join(PERMS_DIR, 'permissions.json');
 let cache: PermissionMap | null = null;
 let yolo = false;
 
+function ensureSecureDir(dir: string): void {
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } catch { /* ignore */ }
+}
+
+function secureWrite(filePath: string, data: string): void {
+  ensureSecureDir(path.dirname(filePath));
+  try {
+    fs.writeFileSync(filePath, data, { mode: 0o600 });
+  } catch {
+    fs.writeFileSync(filePath, data);
+  }
+}
+
 function defaults(): PermissionMap {
   return { bash_run: { alwaysAllow: false, patterns: [] } };
 }
@@ -46,8 +61,7 @@ export function loadPermissions(): PermissionMap {
 export function savePermissions(perms: PermissionMap): void {
   cache = perms;
   try {
-    fs.mkdirSync(PERMS_DIR, { recursive: true });
-    fs.writeFileSync(PERMS_PATH, JSON.stringify(perms, null, 2), 'utf8');
+    secureWrite(PERMS_PATH, JSON.stringify(perms, null, 2));
   } catch {
     // Persist failure is non-fatal — the cache is still updated for the
     // current session, just won't survive a restart.

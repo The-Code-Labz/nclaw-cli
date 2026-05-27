@@ -26,7 +26,9 @@ export interface DisplayEvent {
   fromName?:     string;
   toName?:       string;
   preview?:      string;
+  /** For `interrupted`: human-readable reason the stream was cut short. */
   reason?:       string;
+  /** For `meta`: live model/token/cost info from the server. */
   tokensIn?:     number;
   tokensOut?:    number;
   costUsd?:      number;
@@ -34,21 +36,26 @@ export interface DisplayEvent {
 }
 
 export interface ChatOptions {
-  url:             string;
-  token:           string;
-  message:         string;
-  sessionId?:      string;
-  agentId?:        string;
-  context?:        string;
-  signal?:         AbortSignal;
-  onStall?:        (idleMs: number) => void;
-  onStallClear?:   () => void;
+  url:         string;
+  token:       string;
+  message:     string;
+  sessionId?:  string;
+  agentId?:    string;
+  context?:    string;
+  /** Optional abort signal to cancel the stream */
+  signal?:     AbortSignal;
+  /** Called when the stream has been idle (no chunk + no tool work) this long */
+  onStall?:    (idleMs: number) => void;
+  /** Called when the stall clears */
+  onStallClear?: () => void;
+  /** Idle threshold before onStall fires (default 45_000 ms) */
   stallTimeoutMs?: number;
-  hardAbortMs?:    number;
-  onConfirm:       (command: string) => Promise<import('./confirm').ConfirmResult>;
-  onChunk:         (chunk: string) => void;
-  onSession:       (sessionId: string) => void;
-  onDisplay?:      (e: DisplayEvent) => void;
+  /** Hard kill — abort the request if idle for this long (default 180_000 ms = 3 min) */
+  hardAbortMs?: number;
+  onConfirm:   (command: string) => Promise<import('./confirm').ConfirmResult>;
+  onChunk:     (chunk: string) => void;
+  onSession:   (sessionId: string) => void;
+  onDisplay?:  (e: DisplayEvent) => void;
 }
 
 type SSEEvent = {
@@ -91,13 +98,6 @@ function makeOpts(
   };
 }
 
-const POST_TOOL_TIMEOUT_MS = 30_000;
-
-/**
- * POST a tool result back to the server.
- * Has an explicit 30s timeout to prevent the drain loop from hanging forever
- * if the server is unresponsive.
- */
 function postToolResult(
   url:        string,
   token:      string,
@@ -114,36 +114,11 @@ function postToolResult(
   });
 
   return new Promise((resolve, reject) => {
-    let done = false;
-
-    const timer = setTimeout(() => {
-      if (done) return;
-      done = true;
-      req.destroy();
-      reject(new Error(`postToolResult timed out after ${POST_TOOL_TIMEOUT_MS}ms`));
-    }, POST_TOOL_TIMEOUT_MS);
-
     const req = httpLib(parsed).request(opts, (res) => {
       res.resume();
-      res.on('end', () => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        resolve();
-      });
-      res.on('error', (e) => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        reject(e);
-      });
+      res.on('end', resolve);
     });
-    req.on('error', (e) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      reject(e);
-    });
+    req.on('error', reject);
     req.write(body);
     req.end();
   });
@@ -154,25 +129,17 @@ function postToolResult(
  *
  * Lifecycle:
  *   - `res.on('data')` parses `data: { ... }` lines into an event queue.
- *   - A single `drain()` loop runs serially, awaiting tool execution so we
- *     can post results back before more chunks arrive.
- *   - Resolves when the server signals `[DONE]` AND the queue has drained.
+ *   - A single `drain()` runs serially, awaiting tool execution so we can
+ *     post results back before more chunks arrive.
+ *   - Resolves only when the server signals `[DONE]` AND the queue has drained.
  *   - `signal` aborts the entire request (destroys socket, posts nothing).
- *   - `onStall` fires after `stallTimeoutMs` of no progress.
- *   - Hard abort fires after `hardAbortMs` of idle.
- *   - `postToolResult` has its own 30s timeout so drain never hangs forever.
- *
- * Bug fixes vs original:
- *   - Replaced busy-poll (10ms setInterval for up to 10s) in `res.on('end')`
- *     with a Promise-based drain completion signal via a simple event emitter
- *     pattern — zero CPU waste, instant resolution.
- *   - `postToolResult` now has an explicit timeout (30s) so a slow server
- *     cannot freeze the drain loop indefinitely.
- *   - Chunk buffer swap is atomic: we read and zero in one assignment.
+ *   - `onStall` fires after `stallTimeoutMs` of no progress (no chunks, no
+ *     tool work). The stall timer resets every time data arrives or a tool
+ *     completes. If still idle after `hardAbortMs`, we forcibly abort.
  */
 export function chat(opts: ChatOptions): Promise<void> {
-  const parsed  = new URL(`${opts.url.replace(/\/$/, '')}/api/chat`);
-  const body    = JSON.stringify({
+  const parsed = new URL(`${opts.url.replace(/\/$/, '')}/api/chat`);
+  const body   = JSON.stringify({
     message:   opts.message,
     sessionId: opts.sessionId,
     agentId:   opts.agentId,
@@ -200,19 +167,16 @@ export function chat(opts: ChatOptions): Promise<void> {
 
       let buf             = '';
       let currentSession  = opts.sessionId ?? '';
-      const eventQueue:   SSEEvent[] = [];
+      const eventQueue:     SSEEvent[] = [];
       let processing      = false;
       let serverDone      = false;
       let settled         = false;
-      let toolBusy        = false;
+      let toolBusy        = false;  // suppress stall detection while a tool is running
 
-      // Resolve the promise returned by waitForDrain() when drain finishes.
-      let drainResolve: (() => void) | null = null;
-
-      // ── Stall detection ─────────────────────────────────────────────────
-      let lastProgressAt  = Date.now();
-      let stallNotified   = false;
-      const stallInterval = setInterval(() => {
+      // ── Stall detection ────────────────────────────────────────────────
+      let lastProgressAt   = Date.now();
+      let stallNotified    = false;
+      const stallInterval  = setInterval(() => {
         if (settled || toolBusy) return;
         const idle = Date.now() - lastProgressAt;
         if (idle >= HARD_MS) {
@@ -239,8 +203,6 @@ export function chat(opts: ChatOptions): Promise<void> {
         settled = true;
         clearInterval(stallInterval);
         if (signalListener) opts.signal?.removeEventListener?.('abort', signalListener);
-        // Signal any waiting drain waiter.
-        drainResolve?.();
         if (err) reject(err);
         else resolve();
       };
@@ -250,24 +212,25 @@ export function chat(opts: ChatOptions): Promise<void> {
         if (serverDone && eventQueue.length === 0 && !processing) settle();
       };
 
-      // ── Abort signal ────────────────────────────────────────────────────
+      // ── Abort signal handling ──────────────────────────────────────────
       const signalListener = () => {
         try { req.destroy(); } catch { /* ignore */ }
         settle(new Error('cancelled by user'));
       };
       if (opts.signal) {
-        if (opts.signal.aborted) { signalListener(); return; }
+        if (opts.signal.aborted) {
+          signalListener();
+          return;
+        }
         opts.signal.addEventListener('abort', signalListener, { once: true });
       }
 
-      // ── Drain loop ───────────────────────────────────────────────────────
-      // Returns a Promise that resolves once the drain loop exits.
       async function drain(): Promise<void> {
         if (processing) return;
         processing = true;
         try {
           while (eventQueue.length > 0) {
-            if (settled) return;
+            if (settled) return; // got aborted mid-drain
             const ev = eventQueue.shift()!;
 
             try {
@@ -289,7 +252,6 @@ export function chat(opts: ChatOptions): Promise<void> {
               } else if (ev.type === 'tool_call' && ev.toolCallId && ev.tool) {
                 opts.onDisplay?.({ type: 'tool_call', tool: ev.tool, toolCallId: ev.toolCallId, args: ev.args });
                 toolBusy = true;
-                markProgress();
                 let result: string;
                 try {
                   result = await executeToolCall(ev.tool, ev.args ?? {}, opts.onConfirm);
@@ -297,8 +259,8 @@ export function chat(opts: ChatOptions): Promise<void> {
                   result = JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
                 }
                 toolBusy = false;
-                markProgress();
-                opts.onDisplay?.({ type: 'tool_done', tool: ev.tool, toolCallId: ev.toolCallId, preview: ev.result });
+                markProgress(); // tool completion counts as progress
+                opts.onDisplay?.({ type: 'tool_done', tool: ev.tool, toolCallId: ev.toolCallId });
                 if (settled) return;
                 try {
                   await postToolResult(opts.url, opts.token, currentSession, ev.toolCallId, result);
@@ -336,8 +298,6 @@ export function chat(opts: ChatOptions): Promise<void> {
                   costUsd:   ev.costUsd,
                   model:     ev.model,
                 });
-              } else if (ev.type === 'interrupted') {
-                opts.onDisplay?.({ type: 'interrupted', reason: ev.content ?? 'stream interrupted' });
               }
             } catch (handlerErr) {
               // eslint-disable-next-line no-console
@@ -346,17 +306,8 @@ export function chat(opts: ChatOptions): Promise<void> {
           }
         } finally {
           processing = false;
-          // Signal any waiter blocked on drain completion.
-          drainResolve?.();
-          drainResolve = null;
           maybeResolve();
         }
-      }
-
-      // Returns a Promise that resolves when the current drain loop finishes.
-      function waitForDrain(): Promise<void> {
-        if (!processing) return Promise.resolve();
-        return new Promise<void>(r => { drainResolve = r; });
       }
 
       res.setEncoding('utf8');
@@ -370,19 +321,22 @@ export function chat(opts: ChatOptions): Promise<void> {
           if (!trimmed.startsWith('data: ')) continue;
           const data = trimmed.slice(6);
           if (data === '[DONE]') { serverDone = true; void drain(); continue; }
-          try { eventQueue.push(JSON.parse(data) as SSEEvent); }
-          catch { /* ignore malformed SSE frame */ }
+          try {
+            eventQueue.push(JSON.parse(data) as SSEEvent);
+          } catch (parseErr) {
+            // eslint-disable-next-line no-console
+            console.error('[nclaw] SSE parse error:', parseErr, 'data:', data.slice(0, 200));
+          }
         }
         void drain();
       });
 
       res.on('end', () => {
-        // Flush any remaining data in buf (no trailing \n case).
         if (buf.trim()) {
           const trimmed = buf.trim();
           if (trimmed.startsWith('data: ')) {
             const data = trimmed.slice(6);
-            if (data === '[DONE]') serverDone = true;
+            if (data === '[DONE]') { serverDone = true; }
             else {
               try { eventQueue.push(JSON.parse(data) as SSEEvent); }
               catch { /* ignore */ }
@@ -390,73 +344,80 @@ export function chat(opts: ChatOptions): Promise<void> {
           }
           buf = '';
         }
-
-        // Wait for any in-progress drain to finish — no busy-poll.
-        void (async () => {
-          void drain();
-          await waitForDrain();
-
-          if (!serverDone) {
-            opts.onDisplay?.({ type: 'interrupted', reason: 'connection ended without [DONE]' });
+        void drain();
+        Promise.resolve().then(async () => {
+          // Wait for the in-progress drain to finish (max 10s).
+          const deadline = Date.now() + 10_000;
+          while (processing && Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 10));
           }
-          // Always resolve; App's finally block will commit the partial message.
-          settle();
-        })();
+          if (!serverDone) {
+            // The stream ended without a [DONE] sentinel. Don't reject — that
+            // would lose any text we already streamed into the active bubble.
+            // Instead, emit an `interrupted` display event so the bubble can
+            // show a marker, and resolve normally; the App's finally block
+            // finalizes the partial message into staticMessages.
+            opts.onDisplay?.({
+              type:   'interrupted',
+              reason: 'connection ended without [DONE]',
+            });
+            settle();
+          } else {
+            maybeResolve();
+          }
+        });
       });
-
       res.on('error', (e) => settle(new Error(`(connection lost) ${e.message}`)));
     });
 
     req.on('socket', (socket) => {
       socket.setKeepAlive(true, 10_000);
-      (socket as import('net').Socket).setTimeout(0); // disable idle socket timeout
+      // Disable Node's built-in socket timeout; we manage our own stall timer.
+      socket.setTimeout(0);
     });
-
-    req.on('error', (e) => reject(e));
+    req.on('error', (e) => reject(new Error(`(connection failed) ${e.message}`)));
     req.write(body);
     req.end();
   });
 }
 
-// ── Utility endpoints ────────────────────────────────────────────────────────
+export function listAgents(url: string, token: string): Promise<RemoteAgent[]> {
+  const parsed  = new URL(`${url.replace(/\/$/, '')}/api/agents`);
+  const reqOpts = makeOpts(parsed, 'GET', { 'x-dashboard-token': token });
 
-export async function checkConnection(url: string, token: string): Promise<void> {
-  const parsed = new URL(`${url.replace(/\/$/, '')}/api/status`);
-  const opts   = makeOpts(parsed, 'GET', { 'x-dashboard-token': token });
   return new Promise((resolve, reject) => {
-    const req = httpLib(parsed).request(opts, (res) => {
-      res.resume();
+    const req = httpLib(parsed).request(reqOpts, (res) => {
       if (res.statusCode === 401 || res.statusCode === 403) {
-        reject(new Error('Invalid token — check DASHBOARD_TOKEN'));
-        return;
+        reject(new Error('INVALID_TOKEN')); res.resume(); return;
       }
-      if (res.statusCode !== 200) {
-        reject(new Error(`Server returned HTTP ${res.statusCode}`));
-        return;
-      }
-      resolve();
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (c: string) => { data += c; });
+      res.on('end', () => {
+        try   { resolve(JSON.parse(data) as RemoteAgent[]); }
+        catch { reject(new Error('Failed to parse agents response')); }
+      });
     });
-    req.on('error', (e) => reject(new Error(`Cannot reach server: ${e.message}`)));
-    req.setTimeout(10_000, () => { req.destroy(); reject(new Error('Connection timed out')); });
+    req.on('error', reject);
     req.end();
   });
 }
 
-export async function listAgents(url: string, token: string): Promise<RemoteAgent[]> {
-  const parsed = new URL(`${url.replace(/\/$/, '')}/api/agents`);
-  const opts   = makeOpts(parsed, 'GET', { 'x-dashboard-token': token });
+export function checkConnection(url: string, token: string): Promise<void> {
+  const parsed  = new URL(`${url.replace(/\/$/, '')}/api/status`);
+  const reqOpts = makeOpts(parsed, 'GET', { 'x-dashboard-token': token });
+
   return new Promise((resolve, reject) => {
-    const req = httpLib(parsed).request(opts, (res) => {
-      let raw = '';
-      res.setEncoding('utf8');
-      res.on('data', (d: string) => { raw += d; });
-      res.on('end', () => {
-        try { resolve(JSON.parse(raw) as RemoteAgent[]); }
-        catch { reject(new Error('Invalid agent list response')); }
-      });
+    const req = httpLib(parsed).request(reqOpts, (res) => {
+      if (res.statusCode === 401 || res.statusCode === 403) {
+        reject(new Error('Invalid token — check your dashboard token.')); res.resume(); return;
+      }
+      if (res.statusCode && res.statusCode >= 400) {
+        reject(new Error(`Server returned HTTP ${res.statusCode}`)); res.resume(); return;
+      }
+      res.resume(); resolve();
     });
-    req.on('error', (e) => reject(e));
-    req.setTimeout(10_000, () => { req.destroy(); reject(new Error('listAgents timed out')); });
+    req.on('error', (e) => reject(new Error(`Cannot reach ${url} — ${e.message}`)));
     req.end();
   });
 }

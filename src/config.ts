@@ -11,6 +11,24 @@ export interface NclawConfig {
 const CONFIG_DIR  = path.join(os.homedir(), '.nclaw');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
 
+function ensureSecureDir(dir: string): void {
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } catch {
+    // If mkdir fails, fall through — writeFileSync will likely fail too.
+  }
+}
+
+function secureWrite(filePath: string, data: string): void {
+  ensureSecureDir(path.dirname(filePath));
+  try {
+    fs.writeFileSync(filePath, data, { mode: 0o600 });
+  } catch {
+    // Last resort: try without explicit mode (e.g. on Windows).
+    fs.writeFileSync(filePath, data);
+  }
+}
+
 export function configExists(): boolean {
   return fs.existsSync(CONFIG_PATH);
 }
@@ -21,8 +39,7 @@ export function readConfig(): NclawConfig {
 }
 
 export function writeConfig(cfg: NclawConfig): void {
-  fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8');
+  secureWrite(CONFIG_PATH, JSON.stringify(cfg, null, 2));
 }
 
 /** Returns config, preferring env vars over the file. Throws 'NO_CONFIG' if neither exists. */

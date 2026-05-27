@@ -1,47 +1,38 @@
-/**
- * Local tool executor — runs on the CLIENT machine where nclaw is launched.
- *
- * Critical design principle (Claude Code / opencode parity):
- *   All file and shell operations use `process.cwd()` evaluated at call time,
- *   NOT a constant frozen at module load. This means:
- *     - If the user runs `nclaw` in ~/my-project, all fs_read/write/list
- *       and bash_run ops happen in ~/my-project on THEIR machine.
- *     - If they `/cd` to a new dir, subsequent calls reflect that immediately.
- *
- *   The server-side agent sees the client cwd through the `context` field
- *   (injected by scanTree). The agent then issues tool calls that come back
- *   here to execute locally. This is the same model as Claude Code's
- *   local tool relay.
- *
- * Diff support:
- *   fs_write returns an extended payload with { ok, path, bytes, before, after, mode }
- *   so the TUI can render an inline diff without a second file read.
- *
- * safePath() is intentionally loose — it resolves relative paths against
- * the live cwd and only blocks actual path-traversal escapes (../ above root).
- * There is NO artificial "only within cwd" jail because legitimate tasks
- * (e.g. writing to ~/Desktop, reading /etc/hosts) need to work.
- * The bash_run confirmation gate is the primary safety boundary.
- */
-import fs   from 'fs/promises';
+import fs from 'fs/promises';
 import path from 'path';
 import { execFile, spawn } from 'child_process';
+import fg from 'fast-glob';
 import type { ConfirmResult } from './confirm';
 import { isAllowed, allowAlways, isYoloMode } from './permissions';
 
+const CWD = process.cwd();
+
+// ── Limits (mirroring nightcode's safety caps) ────────────────────────────
+const MAX_FILE_SIZE = 10_000;
+const MAX_RESULTS   = 200;
+const MAX_MATCHES   = 50;
+const MAX_OUTPUT    = 20_000;
+const DEFAULT_TIMEOUT = 30_000;
 const BASH_TIMEOUT_MS = 120_000;
 
-/**
- * Resolve a path relative to the CURRENT working directory.
- * Uses process.cwd() at call time — not a frozen constant.
- */
-function getCwd(): string {
-  return process.cwd();
+function truncate(value: string, limit: number): string {
+  return value.length > limit
+    ? `${value.slice(0, limit)}\n... (truncated, ${value.length} total chars)`
+    : value;
 }
 
-function resolvePath(p: string): string {
-  const expanded = p.replace(/^~/, process.env.HOME ?? process.env.USERPROFILE ?? '~');
-  return path.isAbsolute(expanded) ? expanded : path.resolve(getCwd(), expanded);
+function resolveInsideCwd(p: string): { cwd: string; resolved: string } {
+  const resolved = path.resolve(CWD, p);
+  const rel = path.relative(CWD, resolved);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error(`Path is outside the project directory: ${p}`);
+  }
+  return { cwd: CWD, resolved };
+}
+
+function safePath(p: string): string {
+  const { resolved } = resolveInsideCwd(p);
+  return resolved;
 }
 
 export async function executeToolCall(
@@ -50,138 +41,161 @@ export async function executeToolCall(
   onConfirm: (command: string) => Promise<ConfirmResult>,
 ): Promise<string> {
   switch (tool) {
-
-    // ── fs_read ───────────────────────────────────────────────────────────────
-    case 'fs_read': {
-      const p = resolvePath(args['path'] as string);
-      try {
-        return await fs.readFile(p, 'utf8');
-      } catch (e) {
-        return JSON.stringify({ error: `fs_read failed: ${(e as Error).message}`, path: p });
-      }
+    case 'fs_read':
+    case 'readFile': {
+      const p = safePath(args['path'] as string);
+      const content = await fs.readFile(p, 'utf8');
+      return content.length > MAX_FILE_SIZE
+        ? JSON.stringify({ content: content.slice(0, MAX_FILE_SIZE), truncated: true, totalLength: content.length })
+        : content;
     }
 
-    // ── fs_write ──────────────────────────────────────────────────────────────
-    // Returns { ok, path, bytes, before, after, mode } so the TUI can diff.
-    case 'fs_write': {
-      const p       = resolvePath(args['path'] as string);
-      const content = args['content'] as string;
-      const mode    = (args['mode'] as string | undefined) ?? 'overwrite';
-
-      // Read existing content for diff (null = new file)
-      let before: string | null = null;
-      try { before = await fs.readFile(p, 'utf8'); } catch { /* new file */ }
-
-      try {
-        await fs.mkdir(path.dirname(p), { recursive: true });
-        if (mode === 'append') {
-          await fs.appendFile(p, content, 'utf8');
-        } else if (mode === 'create') {
-          await fs.writeFile(p, content, { encoding: 'utf8', flag: 'wx' });
-        } else {
-          await fs.writeFile(p, content, 'utf8');
-        }
-
-        const after = mode === 'append' ? (before ?? '') + content : content;
-
-        return JSON.stringify({
-          ok:     true,
-          path:   p,
-          bytes:  Buffer.byteLength(content),
-          before,
-          after,
-          mode: (before === null && mode !== 'append') ? 'create' : mode,
-        });
-      } catch (e) {
-        return JSON.stringify({ error: `fs_write failed: ${(e as Error).message}`, path: p });
-      }
+    case 'fs_write':
+    case 'writeFile': {
+      const p = safePath(args['path'] as string);
+      await fs.mkdir(path.dirname(p), { recursive: true });
+      await fs.writeFile(p, args['content'] as string, 'utf8');
+      return JSON.stringify({
+        success: true,
+        path: path.relative(CWD, p),
+        bytesWritten: Buffer.byteLength(args['content'] as string, 'utf8'),
+      });
     }
 
-    // ── fs_list ───────────────────────────────────────────────────────────────
-    case 'fs_list': {
-      const rawPath = (args['path'] as string | undefined) ?? '.';
-      const p       = resolvePath(rawPath);
-      try {
-        const entries = await fs.readdir(p, { withFileTypes: true });
-        return entries
-          .map(e => e.isDirectory() ? `${e.name}/` : e.name)
-          .join('\n');
-      } catch (e) {
-        return JSON.stringify({ error: `fs_list failed: ${(e as Error).message}`, path: p });
-      }
+    case 'fs_edit':
+    case 'editFile': {
+      const p = safePath(args['path'] as string);
+      const oldString = args['oldString'] as string;
+      const newString = args['newString'] as string;
+      const content = await fs.readFile(p, 'utf8');
+      const occurrences = content.split(oldString).length - 1;
+      if (occurrences === 0) throw new Error('oldString not found in file');
+      if (occurrences > 1) throw new Error(`oldString is ambiguous; found ${occurrences} matches`);
+      await fs.writeFile(p, content.replace(oldString, newString), 'utf8');
+      return JSON.stringify({ success: true, path: path.relative(CWD, p) });
     }
 
-    // ── fs_search ─────────────────────────────────────────────────────────────
-    case 'fs_search': {
+    case 'fs_list':
+    case 'listDirectory': {
+      const p = safePath((args['path'] as string | undefined) ?? '.');
+      const entries = await fs.readdir(p, { withFileTypes: true });
+      const results: { name: string; type: 'file' | 'directory' }[] = [];
+      for (const entry of entries) {
+        if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
+        results.push({ name: entry.name, type: entry.isDirectory() ? 'directory' : 'file' });
+      }
+      results.sort((a, b) =>
+        a.type !== b.type ? (a.type === 'directory' ? -1 : 1) : a.name.localeCompare(b.name),
+      );
+      return JSON.stringify({ path: path.relative(CWD, p) || '.', entries: results });
+    }
+
+    case 'glob': {
+      const pattern = (args['pattern'] as string) ?? '**/*';
+      const basePath = safePath((args['path'] as string | undefined) ?? '.');
+      const files = await fg(pattern, {
+        cwd: basePath,
+        dot: false,
+        onlyFiles: true,
+        ignore: ['**/node_modules/**', '**/.git/**'],
+        absolute: false,
+      });
+      const rel = files.map(f => path.relative(CWD, path.resolve(basePath, f))).sort();
+      const truncated = rel.length > MAX_RESULTS;
+      return JSON.stringify({
+        files: rel.slice(0, MAX_RESULTS),
+        ...(truncated ? { truncated: true, totalFiles: rel.length } : {}),
+      });
+    }
+
+    case 'fs_search':
+    case 'grep': {
       const pattern = args['pattern'] as string;
-      const rawPath = (args['path'] as string | undefined) ?? '.';
-      const p       = resolvePath(rawPath);
-      const maxRes  = (args['max_results'] as number | undefined) ?? 50;
-      const cwd     = getCwd();
+      const basePath = safePath((args['path'] as string | undefined) ?? '.');
+      const include = args['include'] as string | undefined;
+      const grepArgs = [
+        '-rn',
+        '--color=never',
+        '--exclude-dir=node_modules',
+        '--exclude-dir=.git',
+        '-E',
+      ];
+      if (include) grepArgs.push(`--include=${include}`);
+      grepArgs.push(pattern, basePath);
 
-      return new Promise<string>(resolve => {
-        const rg = spawn('rg', ['--line-number', '--no-heading', '-e', pattern, p], {
-          cwd, stdio: ['ignore', 'pipe', 'ignore'],
-        });
-        let out = '';
-        rg.stdout.on('data', (d: Buffer) => { out += d.toString(); });
-        rg.on('error', () => {
-          const grep = spawn('grep', ['-rn', pattern, p], {
-            cwd, stdio: ['ignore', 'pipe', 'ignore'],
-          });
-          let gout = '';
-          grep.stdout.on('data', (d: Buffer) => { gout += d.toString(); });
-          grep.on('close', () => {
-            const lines = gout.split('\n').filter(Boolean).slice(0, maxRes);
-            resolve(lines.join('\n') || '(no matches)');
-          });
-          grep.on('error', () => resolve('(fs_search: no search tool available)'));
-        });
-        rg.on('close', () => {
-          const lines = out.split('\n').filter(Boolean).slice(0, maxRes);
-          resolve(lines.join('\n') || '(no matches)');
+      return new Promise<string>((resolve, reject) => {
+        execFile('grep', grepArgs, { cwd: CWD, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+          const exitCode = err && (err as NodeJS.ErrnoException).code !== undefined
+            ? (err as NodeJS.ErrnoException).code
+            : err ? 1 : 0;
+          if (exitCode !== 0 && exitCode !== 1) {
+            reject(new Error(`grep failed: ${stderr.trim()}`));
+            return;
+          }
+          if (!stdout.trim()) {
+            resolve(JSON.stringify({ matches: [], message: 'No matches found' }));
+            return;
+          }
+          const lines = stdout.trim().split('\n');
+          const matches: { file: string; line: number; content: string }[] = [];
+          let truncated = false;
+          for (const line of lines) {
+            if (matches.length >= MAX_MATCHES) { truncated = true; break; }
+            const match = line.match(/^(.+?):(\d+):(.*)$/);
+            if (match) {
+              matches.push({
+                file: path.relative(CWD, match[1]!),
+                line: Number(match[2]),
+                content: match[3]!,
+              });
+            }
+          }
+          resolve(JSON.stringify({
+            matches,
+            ...(truncated ? { truncated: true, totalMatches: lines.length } : {}),
+          }));
         });
       });
     }
 
-    // ── bash_run ──────────────────────────────────────────────────────────────
-    case 'bash_run': {
+    case 'bash_run':
+    case 'bash': {
       const cmd          = args['command'] as string;
-      const cwd          = getCwd();
+      const timeoutArg   = args['timeout'] as number | undefined;
+      const timeoutMs    = timeoutArg ?? DEFAULT_TIMEOUT;
       const isBackground = /&\s*$/.test(cmd);
 
       if (!isYoloMode() && !isAllowed('bash_run', cmd)) {
         const answer = await onConfirm(cmd);
-        if (answer === 'always')  allowAlways('bash_run', cmd);
-        else if (answer === 'no') return JSON.stringify({ error: 'user denied' });
+        if (answer === 'always')   allowAlways('bash_run', cmd);
+        else if (answer === 'no')  return JSON.stringify({ error: 'user denied' });
       }
 
       if (isBackground) {
-        const child = spawn('bash', ['-c', cmd], { cwd, stdio: 'ignore', detached: true });
+        const child = spawn('bash', ['-c', cmd], { cwd: CWD, stdio: 'ignore', detached: true });
         child.unref();
-        return JSON.stringify({ stdout: '[started in background]', stderr: '', exit_code: 0, cwd });
+        return JSON.stringify({ stdout: '[started in background]', stderr: '', exit_code: 0 });
       }
 
+      // Foreground bash with explicit hard-kill on timeout.
       return new Promise<string>((resolve) => {
         let resolved = false;
-        const proc   = execFile(
+        const effectiveTimeout = Math.min(timeoutMs, BASH_TIMEOUT_MS);
+        const proc = execFile(
           'bash',
           ['-c', cmd],
-          { cwd, timeout: BASH_TIMEOUT_MS, killSignal: 'SIGTERM', maxBuffer: 10 * 1024 * 1024 },
+          { cwd: CWD, timeout: effectiveTimeout, killSignal: 'SIGTERM', maxBuffer: 10 * 1024 * 1024, env: { ...process.env, TERM: 'dumb' } },
           (err, stdout, stderr) => {
             if (resolved) return;
-            resolved   = true;
-            const exitCode = err
-              ? ((err as NodeJS.ErrnoException).code != null
-                  ? (err as NodeJS.ErrnoException).code
-                  : 1)
-              : 0;
+            resolved = true;
+            const exitCode = err && (err as NodeJS.ErrnoException).code !== undefined
+              ? (err as NodeJS.ErrnoException).code
+              : err ? 1 : 0;
             const killed = err && (err as { killed?: boolean }).killed;
             resolve(JSON.stringify({
-              stdout:    stdout ?? '',
-              stderr:    stderr ?? '',
+              stdout: truncate(stdout ?? '', MAX_OUTPUT),
+              stderr: truncate(stderr ?? '', MAX_OUTPUT),
               exit_code: exitCode,
-              cwd,
               ...(killed ? { timed_out: true } : {}),
             }));
           },
@@ -192,14 +206,13 @@ export async function executeToolCall(
           if (!resolved) {
             resolved = true;
             resolve(JSON.stringify({
-              stdout:    '',
-              stderr:    `bash_run hard-killed after ${BASH_TIMEOUT_MS + 5_000}ms`,
+              stdout: '',
+              stderr: `bash_run hard-killed after ${effectiveTimeout + 5_000}ms`,
               exit_code: 137,
               timed_out: true,
-              cwd,
             }));
           }
-        }, BASH_TIMEOUT_MS + 5_000);
+        }, effectiveTimeout + 5_000);
         proc.on('exit', () => clearTimeout(hardKill));
       });
     }

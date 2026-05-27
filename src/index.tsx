@@ -4,6 +4,7 @@ import { render } from 'ink';
 import { resolveConfig, writeConfig, configExists, readConfig, NclawConfig } from './config';
 import { checkConnection, listAgents } from './remote';
 import { setYoloMode } from './permissions';
+import { ThemeProvider } from './ui/ThemeProvider';
 import App from './ui/App';
 
 function ask(rl: readline.Interface, question: string): Promise<string> {
@@ -44,8 +45,6 @@ async function runConfig(): Promise<void> {
 }
 
 // ── Bracketed paste mode ────────────────────────────────────────────────────
-// Enables ESC[200~ / ESC[201~ wrappers around pasted text so we can detect
-// and summarise large pastes in the input bar (Claude Code / opencode behaviour).
 const BRACKETED_PASTE_ON  = '\x1b[?2004h';
 const BRACKETED_PASTE_OFF = '\x1b[?2004l';
 
@@ -59,7 +58,6 @@ function disableBracketedPaste(): void {
 async function main(): Promise<void> {
   if (process.argv[2] === 'config') { await runConfig(); return; }
 
-  // --yolo: skip all tool confirmation prompts for this session.
   const yolo = process.argv.includes('--yolo');
   if (yolo) setYoloMode(true);
 
@@ -98,9 +96,12 @@ async function main(): Promise<void> {
   process.on('SIGINT',  () => { cleanup(); process.exit(130); });
   process.on('SIGTERM', () => { cleanup(); process.exit(143); });
 
-  // exitOnCtrlC=false: our InputBar handles Ctrl+C as either abort-stream
-  // or quit (depending on streaming state).
-  render(<App cfg={cfg} agents={agents} />, { exitOnCtrlC: false });
+  render(
+    <ThemeProvider>
+      <App cfg={cfg} agents={agents} />
+    </ThemeProvider>,
+    { exitOnCtrlC: false },
+  );
 }
 
 main();

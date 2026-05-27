@@ -1,12 +1,5 @@
-/**
- * Footer status bar — always shown at the bottom.
- *
- * v0.3.0 additions:
- *   - reconnect indicator — shows "↻ N" when auto-reconnect is in progress
- *   - cwd updates when /cd changes the working directory
- */
 import { Box, Text } from 'ink';
-import { theme } from './theme';
+import { useThemeContext } from './ThemeProvider';
 
 interface Props {
   cwd:         string;
@@ -14,7 +7,6 @@ interface Props {
   host:        string;
   streaming:   boolean;
   toolCount:   number;
-  sessionId?:  string;
   tokensIn?:   number;
   tokensOut?:  number;
   costUsd?:    number;
@@ -22,115 +14,75 @@ interface Props {
   branch?:     string;
   dirty?:      boolean;
   yolo?:       boolean;
-  stalled?:    boolean;
-  reconnect?:  number;  // > 0 = currently reconnecting (attempt N)
 }
 
 function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000)     return `${(n / 1_000).toFixed(1)}k`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
   return String(n);
 }
 
 function fmtCost(usd: number): string {
-  if (usd >= 1)    return `$${usd.toFixed(2)}`;
-  if (usd >= 0.01) return `$${usd.toFixed(3)}`;
-  return `$${usd.toFixed(4)}`;
-}
-
-function Sep() {
-  return <Text color={theme.textFaint}>  ·  </Text>;
+  return usd >= 0.1 ? `$${usd.toFixed(2)}` : `$${usd.toFixed(4)}`;
 }
 
 export default function Footer({
-  cwd, agentName, host, streaming, toolCount, sessionId,
-  tokensIn, tokensOut, costUsd, model, branch, dirty, yolo, stalled, reconnect,
+  cwd, agentName, host, streaming, toolCount,
+  tokensIn, tokensOut, costUsd, model, branch, dirty, yolo,
 }: Props) {
-  const home    = process.env.HOME ?? '';
+  const { colors } = useThemeContext();
+  const home = process.env.HOME ?? '';
   const display = home && cwd.startsWith(home) ? '~' + cwd.slice(home.length) : cwd;
-  const short   = display.length > 38 ? '…' + display.slice(-37) : display;
-
-  // Status indicator
-  let statusColor: string = theme.success;
-  let statusChar          = '●';
-  if (reconnect != null && reconnect > 0) { statusColor = theme.warning; statusChar = '↻'; }
-  else if (stalled)                        { statusColor = theme.warning; statusChar = '◌'; }
-  else if (streaming)                      { statusColor = theme.accent;  statusChar = '◉'; }
-
-  // Session ID (last 8 chars)
-  const shortSid = sessionId ? sessionId.slice(-8) : null;
+  const short = display.length > 40 ? '…' + display.slice(-39) : display;
 
   return (
-    <Box flexDirection="row" justifyContent="space-between" paddingX={1} marginTop={0}>
-      {/* Left: cwd + git */}
+    <Box flexDirection="row" justifyContent="space-between" paddingX={1}>
       <Box>
-        <Text color={theme.textMuted}>{short}</Text>
+        <Text color={colors.textMuted}>{short}</Text>
         {branch && (
           <>
-            <Text color={theme.textFaint}>  ⎇ </Text>
-            <Text color={dirty ? theme.warning : theme.textMuted}>
+            <Text color={colors.textMuted}>  ⎇ </Text>
+            <Text color={dirty ? colors.warning : colors.textMuted}>
               {branch}{dirty ? '*' : ''}
             </Text>
           </>
         )}
       </Box>
-
-      {/* Right */}
       <Box>
-        {yolo && (
-          <>
-            <Text color={theme.error} bold>🔥 YOLO</Text>
-            <Sep />
-          </>
-        )}
-        {reconnect != null && reconnect > 0 && (
-          <>
-            <Text color={theme.warning}>↻ reconnect {reconnect}</Text>
-            <Sep />
-          </>
-        )}
-        {stalled && !(reconnect != null && reconnect > 0) && (
-          <>
-            <Text color={theme.warning}>stalled</Text>
-            <Sep />
-          </>
-        )}
         {model && (
           <>
-            <Text color={theme.textMuted}>{model}</Text>
-            <Sep />
+            <Text color={colors.textMuted}>{model}</Text>
+            <Text color={colors.textMuted}>  ·  </Text>
           </>
         )}
         {(tokensIn != null || tokensOut != null) && (
           <>
-            {tokensIn  != null && <Text color={theme.textMuted}>{fmtTokens(tokensIn)}↑</Text>}
-            <Text color={theme.textFaint}> </Text>
-            {tokensOut != null && <Text color={theme.textMuted}>{fmtTokens(tokensOut)}↓</Text>}
-            <Sep />
+            {tokensIn  != null && <Text color={colors.textMuted}>{fmtTokens(tokensIn)}↑ </Text>}
+            {tokensOut != null && <Text color={colors.textMuted}>{fmtTokens(tokensOut)}↓</Text>}
+            <Text color={colors.textMuted}>  ·  </Text>
           </>
         )}
         {costUsd != null && (
           <>
-            <Text color={theme.textMuted}>{fmtCost(costUsd)}</Text>
-            <Sep />
+            <Text color={colors.textMuted}>{fmtCost(costUsd)}</Text>
+            <Text color={colors.textMuted}>  ·  </Text>
           </>
         )}
+        <Text color={streaming ? colors.warning : colors.success}>● </Text>
+        <Text color={colors.text}>{agentName}</Text>
+        <Text color={colors.textMuted}>  ·  </Text>
+        <Text color={colors.textMuted}>{host}</Text>
         {toolCount > 0 && (
           <>
-            <Text color={theme.textMuted}>{toolCount}⚙</Text>
-            <Sep />
+            <Text color={colors.textMuted}>  ·  </Text>
+            <Text color={colors.textMuted}>{toolCount} tool{toolCount === 1 ? '' : 's'}</Text>
           </>
         )}
-        {shortSid && (
+        {yolo && (
           <>
-            <Text color={theme.textFaint}>{shortSid}</Text>
-            <Sep />
+            <Text color={colors.textMuted}>  ·  </Text>
+            <Text color={colors.error} bold>🔥 YOLO</Text>
           </>
         )}
-        <Text color={statusColor}>{statusChar} </Text>
-        <Text color={theme.text} bold>{agentName}</Text>
-        <Text color={theme.textFaint}>@</Text>
-        <Text color={theme.textMuted}>{host}</Text>
       </Box>
     </Box>
   );

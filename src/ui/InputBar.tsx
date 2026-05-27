@@ -1,13 +1,4 @@
-/**
- * InputBar — interactive prompt, confirm, agent picker.
- *
- * Sizing rules:
- *  - No fixed heights anywhere. Everything sizes to content.
- *  - Suggestion dropdown uses max 6 entries to stay compact.
- *  - Agent picker uses max 8 entries; scrolls with ↑↓.
- *  - All boxes use paddingX={1} not paddingX={2} to save horizontal space.
- */
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo, cloneElement } from 'react';
 import { Box, Text, useInput } from 'ink';
 import { Spinner } from './Spinner';
 import { theme } from './theme';
@@ -16,7 +7,6 @@ import type { RemoteAgent } from '../remote';
 import type { Command, CommandContext } from '../commands/types';
 import { findCommand } from '../commands/registry';
 import { matchCommands } from '../commands/match';
-import { loadHistory, pushHistory } from '../history';
 
 export type ConfirmRequest = {
   command: string;
@@ -36,105 +26,123 @@ interface Props {
   onAgentPick:      () => void;
   onAgentSelected:  (n: number) => void;
   onExit:           () => void;
+  /** Slash-command context. When provided, /commands are resolved via registry. */
   cmdCtx?:          CommandContext;
 }
 
-const PASTE_THRESHOLD = 30;
-const PASTE_LINES     = 3;
-let pasteSeq = 0;
+// A paste is anything bigger than this single-event input length.
+// Single keystrokes are 1 character; pastes arrive as a chunk.
+const PASTE_THRESHOLD_CHARS = 30;
+const PASTE_LINE_THRESHOLD  = 3;
 
-interface PasteRef { id: string; marker: string; text: string; }
+interface PasteRef {
+  id:        string;
+  marker:    string;   // e.g. "[Pasted 12 lines]"
+  text:      string;   // the real content
+}
+
+let pasteSeq = 0;
 
 export default function InputBar({
   streaming, pendingConfirm, pendingAgentPick, agents,
   error, stalled,
   onSubmit, onAbort, onConfirmResolve, onAgentPick, onAgentSelected, onExit, cmdCtx,
 }: Props) {
-  const [value,        setValueRaw]    = useState('');
-  const [cursor,       setCursorRaw]   = useState(0);
-  const [history,      setHistory]     = useState<string[]>(() => loadHistory());
-  const [histIdx,      setHistIdx]     = useState(-1);
-  const [cursorOn,     setCursorOn]    = useState(true);
-  const [suggestIdx,   setSuggestIdx]  = useState(0);
-  const [agentPickIdx, setAgentPickIdx]= useState(0);
+  const [value,   setValueRaw] = useState('');
+  const [cursor,  setCursorRaw] = useState(0);
+  const [history, setHistory]  = useState<string[]>([]);
+  const [histIdx, setHistIdx]  = useState(-1);
+  const [cursorOn, setCursorOn] = useState(true);
+  const [suggestIdx, setSuggestIdx] = useState(0);
 
-  const cursorRef  = useRef(0);
-  const pastesRef  = useRef<Map<string, PasteRef>>(new Map());
-
-  // Keep cursorRef in sync
-  useEffect(() => { cursorRef.current = cursor; }, [cursor]);
-
+  // Wrapped setValue that keeps cursor sane when value mutates externally
+  // (history navigation, slash-command completion, paste insertion).
   function setValue(v: string | ((p: string) => string)) {
     setValueRaw(prev => {
       const next = typeof v === 'function' ? (v as (p: string) => string)(prev) : v;
-      const c    = next.length;
-      setCursorRaw(c);
-      cursorRef.current = c;
+      // If the new value is shorter than the old cursor pos, clamp to end.
+      // Most external setValue callers want cursor at end-of-text.
+      setCursorRaw(next.length);
       return next;
     });
   }
 
-  // ── Slash suggestions ──────────────────────────────────────────────────────
+
+  // Command-suggestion dropdown is visible when the input starts with "/"
+  // and the user has not yet typed a space (i.e. they're still typing the
+  // command name, not its arguments).
   const showSuggest = !pendingConfirm && !pendingAgentPick && !streaming &&
     value.startsWith('/') && !value.includes(' ');
   const suggestions: Command[] = useMemo(
     () => showSuggest ? matchCommands(value, 6) : [],
     [showSuggest, value],
   );
+  // Clamp suggestIdx when the suggestion list shrinks.
   useEffect(() => {
-    if (suggestIdx >= Math.max(1, suggestions.length)) setSuggestIdx(0);
-  }, [suggestions.length]);
+    if (suggestIdx >= suggestions.length) setSuggestIdx(0);
+  }, [suggestions.length, suggestIdx]);
 
-  // ── Cursor blink ───────────────────────────────────────────────────────────
+  // Pasted blocks live in a ref keyed by their marker text so they survive
+  // re-renders.  On submit we substitute the marker with the real content.
+  const pastesRef = useRef<Map<string, PasteRef>>(new Map());
+
+  // Cursor blink when idle
   useEffect(() => {
-    if (streaming || pendingConfirm || pendingAgentPick) { setCursorOn(true); return; }
+    if (streaming || pendingConfirm || pendingAgentPick) {
+      setCursorOn(true);
+      return;
+    }
     const id = setInterval(() => setCursorOn(c => !c), 500);
     return () => clearInterval(id);
   }, [streaming, pendingConfirm, pendingAgentPick]);
 
-  useEffect(() => { if (pendingAgentPick) setAgentPickIdx(0); }, [pendingAgentPick]);
-
-  // ── Paste helpers ──────────────────────────────────────────────────────────
+  // ── Helpers ─────────────────────────────────────────────────────────────
   function buildMarker(text: string): string {
     const lines = (text.match(/\n/g)?.length ?? 0) + 1;
     return `[Pasted ${lines} line${lines === 1 ? '' : 's'} #${++pasteSeq}]`;
   }
+
   function insertAtCursor(text: string) {
     setValueRaw(v => {
-      const c    = Math.min(cursorRef.current, v.length);
+      const c = Math.min(cursor, v.length);
       const next = v.slice(0, c) + text + v.slice(c);
-      const nc   = c + text.length;
-      setCursorRaw(nc);
-      cursorRef.current = nc;
+      setCursorRaw(c + text.length);
       return next;
     });
   }
+
   function insertPaste(raw: string) {
+    // Normalize newlines so terminals that send \r\n don't break the count
     const normalized = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-    const marker     = buildMarker(normalized);
+    const marker = buildMarker(normalized);
     pastesRef.current.set(marker, { id: marker, marker, text: normalized });
     insertAtCursor(marker);
   }
+
   function expandPastes(input: string): string {
     let out = input;
     for (const [marker, paste] of pastesRef.current.entries()) {
+      // Allow multiple occurrences just in case
       out = out.split(marker).join(paste.text);
     }
     return out;
   }
-  function clearPastes() { pastesRef.current.clear(); }
 
-  // ── Input handler ──────────────────────────────────────────────────────────
+  function clearPastesForSubmit() {
+    pastesRef.current.clear();
+  }
+
   useInput((input, key) => {
-    // Global
-    if (key.ctrl && input === 'c') { if (streaming) { onAbort(); return; } onExit(); return; }
-    if (key.escape) {
+    if (key.ctrl && input === 'c') {
       if (streaming) { onAbort(); return; }
-      if (showSuggest) { setValue(''); return; }
+      onExit();
+      return;
+    }
+    if (key.escape && streaming) {
+      onAbort();
       return;
     }
 
-    // Confirm
     if (pendingConfirm) {
       const ch = input.toLowerCase();
       if (ch === 'y') { onConfirmResolve('yes');    return; }
@@ -143,271 +151,337 @@ export default function InputBar({
       return;
     }
 
-    // Agent picker
     if (pendingAgentPick) {
-      const active = agents.filter(a => a.status === 'active');
-      if (key.upArrow)   { setAgentPickIdx(i => (i - 1 + active.length) % active.length); return; }
-      if (key.downArrow) { setAgentPickIdx(i => (i + 1) % active.length); return; }
-      if (key.return)    { onAgentSelected(agentPickIdx + 1); return; }
-      if (key.escape)    { onAgentSelected(0); return; }
-      if (/^\d$/.test(input)) {
-        const n = parseInt(input, 10);
-        if (n >= 1 && n <= active.length) { onAgentSelected(n); return; }
+      if (key.return) {
+        const n = parseInt(value.trim(), 10);
+        if (!isNaN(n) && n >= 1 && n <= agents.length) onAgentSelected(n);
+        else onAgentSelected(0);
+        setValue('');
+        return;
       }
+      if (key.backspace || key.delete) { setValue(v => v.slice(0, -1)); return; }
+      if (/^\d$/.test(input)) { setValue(v => v + input); return; }
       return;
     }
 
-    // Suggestions: arrow nav + Tab/Enter to accept
-    if (showSuggest && suggestions.length > 0) {
-      if (key.upArrow)   { setSuggestIdx(i => (i - 1 + suggestions.length) % suggestions.length); return; }
-      if (key.downArrow) { setSuggestIdx(i => (i + 1) % suggestions.length); return; }
-      if (key.tab) {
-        const chosen = suggestions[suggestIdx];
-        if (chosen) { setValue(chosen.slash + ' '); setSuggestIdx(0); }
-        return;
-      }
-      // fall through for Enter (submits if complete command)
-    }
-
-    if (streaming) return;
-
-    // Paste detection
+    // ── Paste detection ─────────────────────────────────────────────────
+    // Bracketed paste mode wraps content in ESC [200~ and ESC [201~.
+    // We strip those markers if present, then decide whether to summarise.
     let candidate = input;
     if (candidate.startsWith('\u001b[200~')) candidate = candidate.slice(6);
     if (candidate.endsWith('\u001b[201~'))   candidate = candidate.slice(0, -6);
-    if (!key.ctrl && !key.meta && (candidate.length >= PASTE_THRESHOLD || candidate.includes('\n'))) {
+
+    if (
+      !key.ctrl && !key.meta &&
+      (candidate.length >= PASTE_THRESHOLD_CHARS || candidate.includes('\n'))
+    ) {
       const lines = (candidate.match(/\n/g)?.length ?? 0) + 1;
-      if (lines >= PASTE_LINES || candidate.length > 150) { insertPaste(candidate); return; }
+      if (lines >= PASTE_LINE_THRESHOLD || candidate.length > 150) {
+        insertPaste(candidate);
+        return;
+      }
+      // Fallthrough: short multi-line paste, just inline it at cursor.
       insertAtCursor(candidate.replace(/\r\n/g, '\n').replace(/\r/g, '\n'));
       return;
     }
 
-    // Submit
-    if (key.return && !key.shift) {
-      const raw = expandPastes(value).trim();
-      clearPastes();
-      if (!raw) return;
-      if (raw.startsWith('/') && cmdCtx) {
-        const cmd = findCommand(raw);
-        if (cmd) {
-          const parts = raw.trim().split(/\s+/);
-          void cmd.run(cmdCtx, parts.slice(1));
-          setHistory(h => pushHistory(h, raw));
-          setValue('');
-          setHistIdx(-1);
-          return;
-        }
-      }
-      onSubmit(raw);
-      setHistory(h => pushHistory(h, raw));
+    // ── Bash-style line keybinds ───────────────────────────────────────
+    // Shift+Enter / Ctrl+J: insert a literal newline instead of submitting.
+    if ((key.shift && key.return) || (key.ctrl && input === 'j')) {
+      insertAtCursor('\n');
+      return;
+    }
+    // Ctrl+U: clear the entire input.
+    if (key.ctrl && input === 'u') {
+      pastesRef.current.clear();
       setValue('');
-      setHistIdx(-1);
       return;
     }
-
-    // Newline
-    if ((key.shift && key.return) || (key.ctrl && input === 'j')) { insertAtCursor('\n'); return; }
-
-    // History
-    if (key.upArrow && !showSuggest) {
-      const next = Math.min(histIdx + 1, history.length - 1);
-      if (history[next] !== undefined) { setHistIdx(next); setValue(history[next]!); }
-      return;
-    }
-    if (key.downArrow && !showSuggest) {
-      if (histIdx <= 0) { setHistIdx(-1); setValue(''); return; }
-      const next = histIdx - 1;
-      setHistIdx(next);
-      setValue(history[next]!);
-      return;
-    }
-
-    // Cursor movement
-    if (key.leftArrow)  { setCursorRaw(p => { const n = Math.max(0, p-1); cursorRef.current=n; return n; }); return; }
-    if (key.rightArrow) { setCursorRaw(p => { const n = Math.min(value.length, p+1); cursorRef.current=n; return n; }); return; }
-    if ((key.ctrl && input === 'a') || input === '\u001b[H' || input === '\u001bOH') { setCursorRaw(0); cursorRef.current=0; return; }
-    if ((key.ctrl && input === 'e') || input === '\u001b[F' || input === '\u001bOF') { setCursorRaw(value.length); cursorRef.current=value.length; return; }
-    if ((key.ctrl && key.leftArrow) || (key.meta && input === 'b')) {
-      setCursorRaw(p => {
-        let i = p - 1;
-        while (i > 0 && value[i - 1] === ' ') i--;
-        while (i > 0 && value[i - 1] !== ' ') i--;
-        cursorRef.current = i;
-        return i;
-      });
-      return;
-    }
-    if ((key.ctrl && key.rightArrow) || (key.meta && input === 'f')) {
-      setCursorRaw(p => {
-        let i = p;
-        while (i < value.length && value[i] === ' ') i++;
-        while (i < value.length && value[i] !== ' ') i++;
-        cursorRef.current = i;
-        return i;
-      });
-      return;
-    }
-
-    // Editing
-    if (key.backspace || key.delete) {
-      const c = cursorRef.current;
-      if (c === 0) return;
+    // Ctrl+W: delete the previous word (or full paste marker at the tail).
+    if (key.ctrl && input === 'w') {
       setValueRaw(v => {
+        const c = Math.min(cursor, v.length);
+        // If a paste marker ends at the cursor, remove it whole.
         for (const marker of pastesRef.current.keys()) {
           if (v.slice(0, c).endsWith(marker)) {
             pastesRef.current.delete(marker);
             const next = v.slice(0, c - marker.length) + v.slice(c);
-            const nc   = c - marker.length;
-            setCursorRaw(nc); cursorRef.current = nc;
+            setCursorRaw(c - marker.length);
+            return next;
+          }
+        }
+        // Otherwise, trailing whitespace + run of non-whitespace.
+        let end = c;
+        let start = c;
+        while (start > 0 && /\s/.test(v[start - 1]!)) start--;
+        while (start > 0 && !/\s/.test(v[start - 1]!)) start--;
+        const next = v.slice(0, start) + v.slice(end);
+        setCursorRaw(start);
+        return next;
+      });
+      return;
+    }
+    // Ctrl+A: cursor to start.
+    if (key.ctrl && input === 'a') { setCursorRaw(0); return; }
+    // Ctrl+E: cursor to end.
+    if (key.ctrl && input === 'e') { setCursorRaw(value.length); return; }
+    // Ctrl+L: clear screen via registry.
+    if (key.ctrl && input === 'l') {
+      cmdCtx?.clearScreen();
+      return;
+    }
+    // Left / Right arrow: move cursor.
+    if (key.leftArrow)  { setCursorRaw(c => Math.max(0, c - 1)); return; }
+    if (key.rightArrow) { setCursorRaw(c => Math.min(value.length, c + 1)); return; }
+
+    // Slash-command suggestion dropdown: hijack Up/Down/Tab while visible.
+    if (showSuggest && suggestions.length > 0) {
+      if (key.upArrow)   { setSuggestIdx(i => (i - 1 + suggestions.length) % suggestions.length); return; }
+      if (key.downArrow) { setSuggestIdx(i => (i + 1) % suggestions.length); return; }
+      if (key.tab) {
+        const picked = suggestions[suggestIdx];
+        if (picked) {
+          const completed = picked.slash + ' ';
+          setValueRaw(completed);
+          setCursorRaw(completed.length);
+        }
+        return;
+      }
+    }
+
+    // History navigation (only when dropdown is not eating arrow keys).
+    if (key.upArrow) {
+      const next = Math.min(histIdx + 1, history.length - 1);
+      setHistIdx(next);
+      setValue(history[next] ?? '');
+      return;
+    }
+    if (key.downArrow) {
+      const next = histIdx - 1;
+      setHistIdx(next);
+      setValue(next < 0 ? '' : (history[next] ?? ''));
+      return;
+    }
+
+    if (key.return) {
+      const trimmed = value.trim();
+      if (!trimmed) return;
+      // Expand any [Pasted ...] markers into their actual text before submitting.
+      const expanded = expandPastes(trimmed);
+
+      // Slash-command resolution via registry.
+      if (expanded.startsWith('/') && cmdCtx) {
+        const cmd = findCommand(expanded);
+        if (cmd) {
+          const args = expanded.split(/\s+/).slice(1);
+          setHistory(h => [trimmed, ...h].slice(0, 50));
+          setHistIdx(-1);
+          setValue('');
+          clearPastesForSubmit();
+          void Promise.resolve(cmd.run(cmdCtx, args));
+          return;
+        }
+        // Unknown /command — fall through to normal submit so the agent
+        // can decide what to do with it.
+      }
+
+      setHistory(h => [trimmed, ...h].slice(0, 50));
+      setHistIdx(-1);
+      setValue('');
+      clearPastesForSubmit();
+      onSubmit(expanded);
+      return;
+    }
+
+    if (key.backspace || key.delete) {
+      // Delete the character to the LEFT of the cursor. If the segment
+      // ending at the cursor matches a paste marker, remove the entire
+      // marker (and its stored content) in one keypress.
+      setValueRaw(v => {
+        const c = Math.min(cursor, v.length);
+        if (c === 0) return v;
+        for (const marker of pastesRef.current.keys()) {
+          if (v.slice(0, c).endsWith(marker)) {
+            pastesRef.current.delete(marker);
+            const next = v.slice(0, c - marker.length) + v.slice(c);
+            setCursorRaw(c - marker.length);
             return next;
           }
         }
         const next = v.slice(0, c - 1) + v.slice(c);
-        const nc   = c - 1;
-        setCursorRaw(nc); cursorRef.current = nc;
+        setCursorRaw(c - 1);
         return next;
       });
       return;
     }
-    if (key.ctrl && input === 'u') { clearPastes(); setValue(''); return; }
-    if (key.ctrl && input === 'w') {
-      setValueRaw(v => {
-        const c = cursorRef.current;
-        for (const marker of pastesRef.current.keys()) {
-          if (v.slice(0, c).endsWith(marker)) {
-            pastesRef.current.delete(marker);
-            const next = v.slice(0, c - marker.length) + v.slice(c);
-            const nc   = c - marker.length;
-            setCursorRaw(nc); cursorRef.current = nc;
-            return next;
-          }
-        }
-        let start = c;
-        while (start > 0 && v[start - 1] === ' ') start--;
-        while (start > 0 && v[start - 1] !== ' ') start--;
-        const next = v.slice(0, start) + v.slice(c);
-        setCursorRaw(start); cursorRef.current = start;
-        return next;
-      });
-      return;
+    if (input && !key.ctrl && !key.meta) {
+      insertAtCursor(input);
     }
-    if (key.ctrl && input === 'k') {
-      setValueRaw(v => { const next = v.slice(0, cursorRef.current); return next; });
-      return;
-    }
-
-    // Normal character
-    if (input && !key.ctrl && !key.meta && !key.escape) insertAtCursor(input);
   });
 
-  // ── Render helpers ─────────────────────────────────────────────────────────
-  function renderInput(val: string, cur: number): React.ReactNode {
-    const before = val.slice(0, cur);
-    const at     = val[cur] ?? ' ';
-    const after  = val.slice(cur + 1);
-    return (
-      <>
-        <Text color={theme.secondary}>{before}</Text>
-        <Text color={theme.secondary} inverse={cursorOn}>{at}</Text>
-        <Text color={theme.secondary}>{after}</Text>
-      </>
-    );
-  }
-
-  // ── Agent picker ───────────────────────────────────────────────────────────
-  if (pendingAgentPick) {
-    const active = agents.filter(a => a.status === 'active');
-    // Show max 8 agents; scroll window around agentPickIdx
-    const WINDOW = 8;
-    const start  = Math.max(0, Math.min(agentPickIdx - Math.floor(WINDOW / 2), active.length - WINDOW));
-    const visible = active.slice(start, start + WINDOW);
-    return (
-      <Box flexDirection="column" borderStyle="single" borderColor={theme.borderActive} paddingX={1}>
-        <Text color={theme.info} bold>Switch agent</Text>
-        <Text color={theme.textFaint}>↑↓ navigate · Enter select · Esc cancel</Text>
-        {visible.map((a, i) => {
-          const idx = start + i;
-          return (
-            <Box key={a.id}>
-              <Text color={idx === agentPickIdx ? theme.primary : theme.textMuted}>
-                {idx === agentPickIdx ? ' ▶ ' : '   '}{a.name}
-              </Text>
-              {idx === agentPickIdx && <Text color={theme.textFaint}>  {a.role}</Text>}
-            </Box>
-          );
-        })}
-        {active.length > WINDOW && (
-          <Text color={theme.textFaint}> {active.length - WINDOW} more…</Text>
-        )}
-      </Box>
-    );
-  }
-
-  // ── Confirm ────────────────────────────────────────────────────────────────
+  // ── Confirmation dialog ──────────────────────────────────────────────────
   if (pendingConfirm) {
-    const cols  = process.stdout.columns ?? 80;
-    const avail = cols - 20;
-    const cmd   = pendingConfirm.command.length > avail
-      ? pendingConfirm.command.slice(0, avail - 3) + '…'
-      : pendingConfirm.command;
     return (
-      <Box flexDirection="column" borderStyle="single" borderColor={theme.borderWarn} paddingX={1}>
-        <Box>
-          <Text color={theme.warning} bold>Run? </Text>
-          <Text>{cmd}</Text>
+      <Box flexDirection="column" marginBottom={1}>
+        <Box paddingX={1} borderStyle="round" borderColor={theme.borderWarn}>
+          <Text color={theme.warning} bold>⚠ Run command</Text>
         </Box>
-        <Box>
+        <Box paddingX={2}>
+          <Text>{pendingConfirm.command.slice(0, 200)}</Text>
+        </Box>
+        <Box paddingX={2}>
+          <Text dimColor>[</Text>
           <Text color={theme.success} bold>y</Text>
-          <Text color={theme.textMuted}> yes  </Text>
-          <Text color={theme.accent} bold>a</Text>
-          <Text color={theme.textMuted}> always  </Text>
-          <Text color={theme.error} bold>n</Text>
-          <Text color={theme.textMuted}> no</Text>
+          <Text dimColor>]es  [</Text>
+          <Text color={theme.info} bold>a</Text>
+          <Text dimColor>]lways  [</Text>
+          <Text color={theme.error} bold>N</Text>
+          <Text dimColor>]o</Text>
         </Box>
       </Box>
     );
   }
 
-  // ── Suggestion dropdown ────────────────────────────────────────────────────
-  const suggestBox = showSuggest && suggestions.length > 0 ? (
-    <Box flexDirection="column" borderStyle="single" borderColor={theme.border} paddingX={1}>
-      {suggestions.map((s, i) => (
-        <Box key={s.name}>
-          <Text color={i === suggestIdx ? theme.primary : theme.textMuted}>
-            {i === suggestIdx ? ' ▶ ' : '   '}{s.slash}
-          </Text>
-          <Text color={theme.textFaint}>  {s.description}</Text>
+  // ── Agent picker ─────────────────────────────────────────────────────────
+  if (pendingAgentPick) {
+    return (
+      <Box flexDirection="column" marginBottom={1}>
+        <Box paddingX={1} borderStyle="round" borderColor={theme.borderActive}>
+          <Text bold color={theme.info}>select agent</Text>
         </Box>
-      ))}
-      <Text color={theme.textFaint}> ↑↓ Tab to select</Text>
-    </Box>
-  ) : null;
+        {agents.map((a, i) => (
+          <Box key={a.id} paddingX={2}>
+            <Text dimColor>{i + 1}. </Text>
+            <Text bold>{a.name}</Text>
+            <Text dimColor>  ({a.role})</Text>
+          </Box>
+        ))}
+        <Box paddingX={1} borderStyle="round" borderColor={theme.borderActive}>
+          <Text dimColor>{`select [1-${agents.length}]: `}</Text>
+          <Text>{value}</Text>
+          <Text color={theme.secondary}>█</Text>
+        </Box>
+      </Box>
+    );
+  }
+
+  // ── Normal prompt ────────────────────────────────────────────────────────
+  const borderColor = streaming
+    ? (stalled ? theme.borderError : theme.borderWarn)
+    : error ? theme.borderError : theme.border;
+
+  // Multi-line rendering: split the value at \n boundaries and emit one row
+  // per logical line. The prompt arrow only decorates the first line; later
+  // lines get a 2-space indent so they visually align under the typed text.
+  // The cursor block is drawn at its exact position by splitting whichever
+  // line contains it into (before|cursor|after).
+  const lines = value.length === 0 ? [''] : value.split('\n');
+  // Map cursor (absolute index in value) to (lineIdx, colIdx).
+  let cursorLine = 0;
+  let cursorCol  = 0;
+  {
+    let remaining = Math.min(cursor, value.length);
+    for (let i = 0; i < lines.length; i++) {
+      const lineLen = lines[i]!.length;
+      if (remaining <= lineLen) { cursorLine = i; cursorCol = remaining; break; }
+      remaining -= lineLen + 1; // +1 for the consumed \n
+    }
+  }
+
+  function renderLine(line: string, idx: number, isCursorLine: boolean): JSX.Element[] {
+    const reKey = (els: JSX.Element[], prefix: string) =>
+      els.map((el, i) => cloneElement(el, { key: `${prefix}-${idx}-${i}` }));
+    const segs = reKey(renderValueWithPastes(line, pastesRef.current), 's');
+    if (!isCursorLine || streaming || !cursorOn) {
+      return segs.length ? segs : [<Text key={`empty-${idx}`}> </Text>];
+    }
+    // Split at cursor column. Each half is rendered through the same
+    // paste-aware helper so marker styling is preserved.
+    const before = line.slice(0, cursorCol);
+    const after  = line.slice(cursorCol);
+    return [
+      ...reKey(renderValueWithPastes(before, pastesRef.current), 'b'),
+      <Text key={`c-${idx}`} color={theme.secondary}>█</Text>,
+      ...reKey(renderValueWithPastes(after, pastesRef.current), 'a'),
+    ];
+  }
 
   return (
     <Box flexDirection="column">
-      {suggestBox}
       {error && (
-        <Box paddingLeft={1}>
-          <Text color={theme.error}>✗ {error}</Text>
+        <Box paddingX={1}>
+          <Text color={theme.error}>✗ </Text>
+          <Text dimColor>{error}</Text>
         </Box>
       )}
+
       {stalled && streaming && (
-        <Box paddingLeft={1}>
-          <Spinner color={theme.warning} />
-          <Text color={theme.warning}> stalled…  Ctrl+C to abort</Text>
+        <Box paddingX={1}>
+          <Text color={theme.warning}>! </Text>
+          <Text dimColor>agent appears stalled — press Esc to cancel</Text>
         </Box>
       )}
-      {streaming ? (
-        <Box paddingLeft={1}>
-          <Spinner color={theme.accent} />
-          <Text color={theme.textMuted}> responding  ·  Ctrl+C / Esc to abort</Text>
-        </Box>
-      ) : (
-        <Box paddingLeft={1}>
-          <Text color={theme.secondary} bold>❯ </Text>
-          {renderInput(value, cursor)}
+
+      {showSuggest && suggestions.length > 0 && (
+        <Box flexDirection="column" paddingX={1} marginBottom={0}>
+          {suggestions.map((cmd, i) => (
+            <Box key={cmd.slash}>
+              <Text color={i === suggestIdx ? theme.info : theme.textMuted}>
+                {i === suggestIdx ? '› ' : '  '}
+              </Text>
+              <Text color={i === suggestIdx ? theme.info : theme.text} bold={i === suggestIdx}>
+                {cmd.slash}
+              </Text>
+              <Text color={theme.textMuted}>  {cmd.description}</Text>
+            </Box>
+          ))}
+          <Box>
+            <Text color={theme.textMuted} dimColor>  tab to complete · ↑↓ to navigate</Text>
+          </Box>
         </Box>
       )}
+
+      <Box flexDirection="column" paddingX={1} borderStyle="round" borderColor={borderColor}>
+        {lines.map((line, idx) => (
+          <Box key={`l-${idx}`}>
+            {idx === 0
+              ? (streaming
+                  ? <Spinner color={stalled ? theme.error : theme.warning} />
+                  : <Text color={theme.secondary}>›</Text>)
+              : <Text>  </Text>}
+            <Text> </Text>
+            {renderLine(line, idx, idx === cursorLine)}
+          </Box>
+        ))}
+      </Box>
     </Box>
   );
+}
+
+/**
+ * Split the textbox value into normal-text and paste-marker segments so we
+ * can style the markers (dim italic) differently from typed text.
+ */
+function renderValueWithPastes(value: string, pastes: Map<string, PasteRef>): JSX.Element[] {
+  if (pastes.size === 0) return [<Text key="t">{value}</Text>];
+  // Build a regex matching any of the markers (escape regex metas).
+  const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp([...pastes.keys()].map(escape).join('|'), 'g');
+  const out: JSX.Element[] = [];
+  let lastIdx = 0;
+  let key = 0;
+  for (const m of value.matchAll(pattern)) {
+    const idx = m.index ?? 0;
+    if (idx > lastIdx) {
+      out.push(<Text key={key++}>{value.slice(lastIdx, idx)}</Text>);
+    }
+    out.push(
+      <Text key={key++} color={theme.info} italic>{m[0]}</Text>,
+    );
+    lastIdx = idx + m[0].length;
+  }
+  if (lastIdx < value.length) {
+    out.push(<Text key={key++}>{value.slice(lastIdx)}</Text>);
+  }
+  return out;
 }

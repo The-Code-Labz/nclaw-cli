@@ -1,40 +1,24 @@
-/**
- * Terminal markdown renderer — safe for mid-stream partial input.
- *
- * Uses marked + marked-terminal with a custom palette matching our theme.
- * Falls back to raw text on any parse failure.
- *
- * Improvements over original:
- * - Syntax highlighting via cli-highlight (optional, graceful fallback)
- * - Better code fence handling on partial streams (strips unclosed fences)
- * - Heading levels h1-h3 styled distinctly
- * - Consistent table rendering
- */
+// Terminal markdown rendering for assistant text.
+// Uses `marked` + `marked-terminal` with a custom renderer wired into our theme.
+//
+// IMPORTANT: this function is called mid-stream with possibly-malformed input
+// (unclosed code fences, dangling backticks, etc). On any parse error it
+// returns the original input untouched.
 
 import { marked } from 'marked';
 import { markedTerminal } from 'marked-terminal';
 import chalk from 'chalk';
 
-// ── Palette (mirrors theme.ts but uses chalk directly) ───────────────────────
-const clrPrimary  = chalk.hex('#A855F7');
-const clrAccent   = chalk.hex('#FBBF24');
-const clrInfo     = chalk.hex('#60A5FA');
-const clrSuccess  = chalk.hex('#22C55E');
-const clrMuted    = chalk.hex('#6B7280');
-const clrWarn     = chalk.hex('#F59E0B');
+// Theme color mapping. We mirror src/ui/theme.ts but use chalk's color functions
+// directly because marked-terminal does not understand Ink's named theme tokens.
+const accent     = chalk.yellow;
+const info       = chalk.blueBright;
+const primary    = chalk.magenta;
+const textMuted  = chalk.gray;
 
-// ── cli-highlight (optional) ─────────────────────────────────────────────────
-// If the package isn't installed we silently skip syntax coloring.
-let highlight: ((code: string, opts: { language: string }) => string) | null = null;
-try {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const ch = require('cli-highlight');
-  highlight = ch.highlight;
-} catch { /* not installed — graceful degradation */ }
-
-// ── configured flag ───────────────────────────────────────────────────────────
+// Configure marked-terminal once at module load. Reflow / emoji are disabled
+// because terminal width is unpredictable and emoji breaks alignment.
 let configured = false;
-
 function configure(): void {
   if (configured) return;
   configured = true;
@@ -42,9 +26,9 @@ function configure(): void {
   marked.use(
     markedTerminal(
       {
-        // Headings
-        firstHeading: clrInfo.bold.underline,     // h1
-        heading:      clrPrimary.bold,             // h2+
+        // Headers
+        firstHeading: info.bold,           // h1
+        heading:      primary.bold,        // h2+ (overridden below for granularity)
 
         // Emphasis
         strong: chalk.bold,
@@ -52,86 +36,62 @@ function configure(): void {
         del:    chalk.strikethrough,
 
         // Code
-        code: (text: string, lang?: string): string => {
-          if (highlight && lang) {
-            try {
-              const colored = highlight(text, { language: lang });
-              const border  = clrMuted('─'.repeat(Math.min(60, process.stdout.columns ?? 80)));
-              return `\n${border}\n${colored}\n${border}`;
-            } catch { /* unsupported language */ }
-          }
-          // Fallback: dim the block with a simple border
-          const border = clrMuted('─'.repeat(Math.min(60, process.stdout.columns ?? 80)));
-          return `\n${border}\n${clrMuted(text)}\n${border}`;
-        },
-        codespan: clrAccent,                       // `inline code`
+        code:        (text: string) => text, // block code: no syntax highlighting; preserve as-is
+        codespan:    accent,                  // inline code
 
         // Lists
         listitem: (text: string) => text,
         list:     (text: string) => text,
 
-        // Links
+        // Links / images render as: text (url) in muted color
         link: (href: string, _title: string | undefined, text: string) => {
           const label = text || href;
-          if (!href || href === label) return clrInfo(label);
-          return `${chalk.underline(label)} ${clrMuted('(' + href + ')')}`;
+          if (!href || href === label) return textMuted(label);
+          return `${label} ${textMuted('(' + href + ')')}`;
         },
-        href: (href: string) => clrInfo.underline(href),
+        href: (href: string) => textMuted(href),
 
         // Blockquote
-        blockquote: clrMuted.italic,
+        blockquote: textMuted.italic,
 
-        // HR
-        hr: () => clrMuted('─'.repeat(Math.min(60, process.stdout.columns ?? 80))),
+        // Horizontal rule
+        hr: () => textMuted('─'.repeat(40)),
 
-        // Tables
+        // Tables — just dim, nothing fancy
         table: (text: string) => text,
 
-        // Paragraph / text pass-through
+        // Misc
         paragraph: (text: string) => text,
         text:      (text: string) => text,
 
-        // Layout
-        reflowText:        false,
-        tab:               2,
+        // Knobs
+        reflowText:  false,         // do NOT reflow — terminal width is unpredictable
+        tab:         2,
         showSectionPrefix: false,
-        unescape:          true,
-        emoji:             false,
-        width:             0,
+        unescape:    true,
+        emoji:       false,         // do NOT auto-replace :emoji: shortcuts
+        width:       0,             // 0 disables width-based wrapping
       },
+      // Pass our highlight options (no syntax highlighter — keep deps lean)
       {},
     ),
   );
 }
 
 /**
- * Sanitise partial mid-stream markdown so marked doesn't crash on unclosed
- * constructs. We:
- * 1. Close any unclosed triple-backtick fences.
- * 2. Do NOT close bold/italic spans — they're cheap to leave open.
- */
-function sanitizePartial(input: string): string {
-  // Count backtick fences
-  const fenceRe = /^```/gm;
-  const matches = input.match(fenceRe);
-  if (matches && matches.length % 2 !== 0) {
-    // Odd number of fences → add a closing fence.
-    return input + '\n```';
-  }
-  return input;
-}
-
-/**
  * Render markdown to ANSI-colored terminal output.
- * Safe to call on partial / mid-stream text. Falls back to raw input on error.
+ * Safe to call on partial/mid-stream text — falls back to the raw input
+ * if parsing fails (e.g. unclosed code fence).
  */
 export function renderMarkdown(input: string): string {
   if (!input) return input;
   try {
     configure();
-    const safe = sanitizePartial(input);
-    const out  = marked.parse(safe, { async: false }) as string;
-    // Strip trailing newline that marked-terminal appends.
+    // marked.parse may return a Promise in newer versions if async extensions
+    // are used; with our config it returns a string synchronously.
+    const out = marked.parse(input, { async: false }) as string;
+    // marked-terminal appends a trailing newline; strip it so we don't get
+    // an extra blank row in the bubble.
     return typeof out === 'string' ? out.replace(/\n$/, '') : input;
   } catch {
     return input;
