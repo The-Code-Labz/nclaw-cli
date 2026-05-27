@@ -1,42 +1,35 @@
-// NeuroClaw CLI — visual theme
-// Inspired by Claude Code + OpenCode palettes.
-// All hex strings are supported by Ink via chalk under the hood.
+// Inspired by OpenCode's theme palette — works with Ink's default chalk palette.
+// Ink's `color` prop accepts named colors and hex strings.
 
 export const theme = {
   // Text
-  text:        'white',
-  textMuted:   '#6B7280',   // gray-500 — secondary/dim content
-  textFaint:   '#374151',   // gray-700 — very dim
+  text:        'white',           // primary content
+  textMuted:   'gray',            // secondary/dim content
   textInverse: 'black',
+  textFaint:   'gray',            // very dim / decorative text (dividers, context lines)
 
-  // Brand
-  primary:     '#A855F7',   // purple-500 — agent name, primary accents
-  secondary:   '#22D3EE',   // cyan-400   — user name, prompt cursor
-  accent:      '#FBBF24',   // amber-400  — tool icons, spinner
+  // Brand / accents
+  primary:     'magenta',         // assistant name + spinner highlight
+  secondary:   'cyanBright',      // user name + prompt cursor
+  accent:      'yellow',          // tool icons / spinner
+  brand:       'magenta',         // logo / branding color (alias for primary)
 
   // Status
-  success:     '#22C55E',   // green-500
-  warning:     '#F59E0B',   // amber-500
-  error:       '#EF4444',   // red-500
-  info:        '#60A5FA',   // blue-400
+  success:     'green',
+  warning:     'yellow',
+  error:       'red',
+  info:        'blueBright',
 
-  // Borders / structure
-  border:      '#374151',   // gray-700
-  borderActive:'#22D3EE',   // cyan-400
-  borderWarn:  '#F59E0B',
-  borderError: '#EF4444',
-
-  // Surfaces
-  surface:     '#111827',   // gray-900
-  surfaceRaised:'#1F2937',  // gray-800
-
-  // NeuroClaw brand
-  brand:       '#8B5CF6',   // violet-500
+  // Borders
+  border:      'gray',
+  borderActive:'cyan',
+  borderWarn:  'yellow',
+  borderError: 'red',
 } as const;
 
-export type ThemeColor = string;
+export type ThemeColor = (typeof theme)[keyof typeof theme];
 
-// ── Tool visual identity ──────────────────────────────────────────────────
+// Per-tool visual identity, ported from OpenCode (InlineTool icon + pending).
 export interface ToolStyle {
   icon:    string;
   color:   string;
@@ -47,58 +40,48 @@ const DEFAULT_TOOL: ToolStyle = { icon: '⚙', color: theme.accent, pending: 'Wo
 
 const TOOLS: Record<string, ToolStyle> = {
   // File ops
-  fs_read:    { icon: '↗', color: theme.info,    pending: 'Reading...'           },
-  read:       { icon: '↗', color: theme.info,    pending: 'Reading...'           },
-  fs_write:   { icon: '↙', color: theme.success, pending: 'Writing...'           },
-  write:      { icon: '↙', color: theme.success, pending: 'Writing...'           },
-  fs_edit:    { icon: '↙', color: theme.success, pending: 'Editing...'           },
-  edit:       { icon: '↙', color: theme.success, pending: 'Editing...'           },
-  fs_list:    { icon: '⋮', color: theme.info,    pending: 'Listing...'           },
-  fs_search:  { icon: '✦', color: theme.accent,  pending: 'Searching files...'   },
-  glob:       { icon: '✦', color: theme.accent,  pending: 'Finding files...'     },
-  grep:       { icon: '✦', color: theme.accent,  pending: 'Searching content...' },
+  fs_read:   { icon: '→', color: theme.info,    pending: 'Reading...'         },
+  read:      { icon: '→', color: theme.info,    pending: 'Reading...'         },
+  fs_write:  { icon: '←', color: theme.success, pending: 'Preparing write...' },
+  write:     { icon: '←', color: theme.success, pending: 'Preparing write...' },
+  fs_edit:   { icon: '←', color: theme.success, pending: 'Preparing edit...'  },
+  edit:      { icon: '←', color: theme.success, pending: 'Preparing edit...'  },
+  fs_list:   { icon: '⋮', color: theme.info,    pending: 'Listing...'         },
+  glob:      { icon: '✱', color: theme.accent,  pending: 'Finding files...'   },
+  grep:      { icon: '✱', color: theme.accent,  pending: 'Searching content...' },
 
   // Shell
-  bash_run:   { icon: '$', color: theme.primary, pending: 'Running command...'   },
-  shell:      { icon: '$', color: theme.primary, pending: 'Running command...'   },
-  bash:       { icon: '$', color: theme.primary, pending: 'Running command...'   },
+  bash_run:  { icon: '$', color: theme.primary, pending: 'Writing command...' },
+  shell:     { icon: '$', color: theme.primary, pending: 'Writing command...' },
+  bash:      { icon: '$', color: theme.primary, pending: 'Writing command...' },
 
   // Web
-  webfetch:         { icon: '⬡', color: theme.info, pending: 'Fetching...'         },
-  browserless_fetch:{ icon: '⬡', color: theme.info, pending: 'Fetching page...'    },
-  mcp__crawl4ai__crawl_page: { icon: '⬡', color: theme.info, pending: 'Crawling...' },
-  websearch:        { icon: '◈', color: theme.info, pending: 'Searching web...'    },
-  web_search:       { icon: '◈', color: theme.info, pending: 'Searching web...'    },
+  webfetch:        { icon: '%', color: theme.info, pending: 'Fetching from the web...' },
+  browserless_fetch: { icon: '%', color: theme.info, pending: 'Fetching page...' },
+  websearch:       { icon: '◈', color: theme.info, pending: 'Searching web...' },
+  web_search:      { icon: '◈', color: theme.info, pending: 'Searching web...' },
 
-  // Patch
-  apply_patch: { icon: '⊕', color: theme.success, pending: 'Applying patch...'    },
+  // Patch / apply
+  apply_patch: { icon: '%', color: theme.success, pending: 'Preparing patch...' },
 
-  // Tasks / agents
-  task:              { icon: '│', color: theme.info,    pending: 'Spawning subagent...' },
-  run_subtask:       { icon: '│', color: theme.info,    pending: 'Running subtask...'   },
-  spawn_agent:       { icon: '│', color: theme.info,    pending: 'Spawning agent...'    },
-  message_agent:     { icon: '✉', color: theme.primary, pending: 'Messaging agent...'   },
-  assign_task_to_agent:{ icon: '↪', color: theme.primary, pending: 'Assigning task...'  },
-  notify_user:       { icon: '⚠', color: theme.warning, pending: 'Notifying...'         },
-  ask_alfred:        { icon: '✉', color: theme.primary, pending: 'Asking Alfred...'      },
-
-  // Memory / vault
-  search_memory:            { icon: '◇', color: theme.info,    pending: 'Searching memory...' },
-  retrieve_relevant_memory: { icon: '◇', color: theme.info,    pending: 'Recalling...'         },
-  write_vault_note:         { icon: '◆', color: theme.success, pending: 'Saving note...'       },
-  save_session_summary:     { icon: '◆', color: theme.success, pending: 'Summarising...'       },
-  compact_context:          { icon: '◆', color: theme.success, pending: 'Compacting...'        },
-  get_context_pack:         { icon: '◇', color: theme.info,    pending: 'Loading context...'   },
-
-  // Projects / tasks
-  find_projects:   { icon: '⊞', color: theme.info,    pending: 'Finding projects...' },
-  manage_project:  { icon: '⊞', color: theme.success, pending: 'Managing project...' },
-  find_tasks:      { icon: '☑', color: theme.info,    pending: 'Finding tasks...'    },
-  manage_task:     { icon: '☑', color: theme.success, pending: 'Managing task...'    },
-
-  // Misc
+  // Tasks
+  task:      { icon: '│', color: theme.info,    pending: 'Spawning subagent...' },
   todowrite: { icon: '⚙', color: theme.accent,  pending: 'Updating todos...'    },
-  question:  { icon: '?', color: theme.warning, pending: 'Asking...'            },
+  question:  { icon: '→', color: theme.warning, pending: 'Asking questions...'  },
+  skill:     { icon: '→', color: theme.info,    pending: 'Loading skill...'     },
+
+  // Memory / vault (NeuroClaw-specific)
+  search_memory:           { icon: '◇', color: theme.info, pending: 'Searching memory...' },
+  retrieve_relevant_memory:{ icon: '◇', color: theme.info, pending: 'Recalling...'        },
+  write_vault_note:        { icon: '◆', color: theme.success, pending: 'Saving note...'   },
+  save_session_summary:    { icon: '◆', color: theme.success, pending: 'Summarising...'   },
+
+  // Agent comms
+  message_agent:       { icon: '✉', color: theme.primary, pending: 'Messaging agent...' },
+  assign_task_to_agent:{ icon: '↪', color: theme.primary, pending: 'Assigning task...' },
+  notify_user:         { icon: '⚠', color: theme.warning, pending: 'Notifying user...' },
+  spawn_agent:         { icon: '│', color: theme.info,    pending: 'Spawning agent...' },
+  run_subtask:         { icon: '│', color: theme.info,    pending: 'Running subtask...' },
 };
 
 export function toolStyle(tool: string): ToolStyle {

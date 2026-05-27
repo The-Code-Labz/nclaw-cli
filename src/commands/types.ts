@@ -12,20 +12,18 @@ export interface CommandContext {
   getLastAgentMessage: () => string | null;
   /** Append a synthetic system message to the transcript. */
   emitSystem:    (text: string) => void;
-  /** Stream lines into the transcript in real time (for /update). */
-  emitLines:     (lines: string[]) => void;
-  /** Change the process working directory and update footer. */
-  changeCwd:     (dir: string) => void;
-  /** List the current working directory and emit inline. */
-  listCwd:       () => Promise<void>;
+  /** Show a toast notification. Optional — safe to omit in tests. */
+  showToast?:    (message: string, variant?: 'info' | 'success' | 'error', duration?: number) => void;
+  /** Cycle to the next color theme. Optional — safe to omit in tests. */
+  cycleTheme?:   () => void;
 }
 
 export type CommandCategory = 'session' | 'agent' | 'system' | 'help';
 
 export interface Command {
-  name:        string;
-  slash:       string;
-  aliases?:    string[];
+  name:        string;             // canonical, e.g. "clear"
+  slash:       string;             // "/clear"
+  aliases?:    string[];           // ["/cls"]
   description: string;
   category:    CommandCategory;
   run:         (ctx: CommandContext, args: string[]) => void | Promise<void>;
