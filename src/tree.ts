@@ -1,4 +1,5 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 const IGNORE_NAMES = new Set([
@@ -13,9 +14,21 @@ const IGNORE_EXTS = new Set([
 ]);
 
 export function scanTree(dir: string, maxDepth = 4): string {
+  const hostname = os.hostname();
+
   const lines: string[] = [
-    `Working directory: ${dir}`,
-    `IMPORTANT: bash_run commands execute with cwd already set to this directory. Run commands directly — never prefix with \`cd ${dir} &&\` or \`cd /path &&\`.`,
+    `=== CLIENT MACHINE CONTEXT (NOT the NeuroClaw server) ===`,
+    `Client hostname:          ${hostname}`,
+    `Client working directory: ${dir}`,
+    `Client platform:          ${process.platform}`,
+    `=== END CLIENT CONTEXT ===`,
+    ``,
+    `CRITICAL: The above is the REMOTE CLIENT machine (${hostname}), NOT the NeuroClaw server.`,
+    `Tools relayed via this nclaw-cli session (bash_run, fs_read, fs_write, fs_edit, fs_list, glob, fs_search)`,
+    `execute ON THE CLIENT (${hostname}) in the directory above — NOT on the NeuroClaw server.`,
+    `When the user says "my current directory" or "where am I", the answer is: ${dir} on ${hostname}.`,
+    ``,
+    `IMPORTANT: bash_run commands execute with cwd already set to ${dir}. Run commands directly — never prefix with \`cd ${dir} &&\` or \`cd /path &&\`.`,
     `IMPORTANT: When executing a multi-step task, complete the full task in a single response. Do NOT stop mid-task to ask "shall I continue?". Use tools iteratively until done. Only stop if blocked by missing information you cannot discover yourself.`,
     `WORKFLOW: For any implementation task follow this order — (1) Plan: state what you'll build and how; (2) Execute: write all code and files completely; (3) Test: run the dev server or test command and capture real output; (4) Debug: if there are errors, fix them in the same response before moving on; (5) Ship: only declare done once you've verified it runs.`,
     `HANDOFF: After every completed task, end your response with a structured walkthrough the user can follow. Use this exact format:\n  WHAT WAS BUILT — 1-2 sentence description of what you built and the problem it solves\n  FILES — list every file created or modified with a one-line description of its role\n  HOW TO RUN — the exact command(s) to start or use it\n  WALKTHROUGH — describe what the user will actually see and interact with, screen by screen or feature by feature\n  HONEST NOTES — anything that isn't perfect yet, known limitations, or what you'd tackle next\nThis walkthrough is mandatory. Never skip it. The user needs to understand what was built without reading the code.`,
@@ -105,4 +118,3 @@ This file is read by nclaw AI agents on every turn. Fill in the sections below s
     WALKTHROUGH — what the user will see and interact with
     HONEST NOTES — limitations, known issues, what to tackle next
 `;
-
