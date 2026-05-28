@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import type { Command } from './types';
+import { runUpdate } from '../updater';
 
 // ── Clipboard helpers ───────────────────────────────────────────────────────
 // Try clipboard tools in order: pbcopy (mac), wl-copy (wayland), xclip,
@@ -169,6 +170,47 @@ export const commands: Command[] = [
         ctx.emitSystem(now ? '🔥 Yolo mode enabled — bash commands will not prompt for confirmation.' : 'Yolo mode disabled.');
       } catch {
         ctx.emitSystem('/yolo: permissions module not available');
+      }
+    },
+  },
+  {
+    name: 'update',
+    slash: '/update',
+    description: 'Pull latest nclaw from git and rebuild',
+    category: 'system',
+    run: async (ctx) => {
+      ctx.emitSystem('Starting self-update (git pull → npm install → npm run build)…');
+      ctx.showToast?.('Updating nclaw…', 'info', 4000);
+
+      let exitCode = 0;
+      try {
+        for await (const line of runUpdate()) {
+          switch (line.stream) {
+            case 'info':
+              ctx.emitSystem(`ℹ  ${line.text}`);
+              break;
+            case 'stdout':
+              ctx.emitSystem(`   ${line.text}`);
+              break;
+            case 'stderr':
+              ctx.emitSystem(`⚠  ${line.text}`);
+              break;
+            case 'error':
+              ctx.emitSystem(`✗  ${line.text}`);
+              exitCode = 1;
+              break;
+          }
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        ctx.emitSystem(`✗  Update failed: ${msg}`);
+        exitCode = 1;
+      }
+
+      if (exitCode === 0) {
+        ctx.showToast?.('Update complete — restart nclaw to apply', 'success', 5000);
+      } else {
+        ctx.showToast?.('Update failed — check output above', 'error', 5000);
       }
     },
   },
